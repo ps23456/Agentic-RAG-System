@@ -1,0 +1,60 @@
+Patient Name: Rika Popper
+Policy Number: 62118947606
+
+|  Patient can: | Never | Occasionally (Up to 33%) | Frequently (34%-66%) | Continuously (67%-100%)  |
+| --- | --- | --- | --- | --- |
+|  BEND/TWIST AT WAIST | ☐ | ☐ | ☐ | ☑  |
+|  BEND/TWIST AT NECK | ☐ | ☑ | ☐ | ☐  |
+|  SQUAT | ☐ | ☐ | ☐ | ☑  |
+|  CRAWL | ☑ | ☐ | ☐ | ☐  |
+|  CLIMB | ☑ | ☐ | ☐ | ☐  |
+|  BALANCE | ☑ | ☐ | ☐ | ☐  |
+|  REACH (BELOW SHOULDER) | ☐ | ☑ | ☐ | ☐  |
+|  REACH (ABOVE SHOULDER) | ☐ | ☑ | ☐ | ☐  |
+|  COMPUTER KEYBOARDING | ☐ | ☑ | ☐ | ☐  |
+|  MOUSE USAGE | ☐ | ☑ | ☐ | ☐  |
+|  HANDLING | Simple Grasping | Fine Manipulation | Pushing and Pulling  |
+| --- | --- | --- | --- |
+|  Right | ☑ Yes ☐ No | ☐ Yes ☑ No | ☑ Yes ☐ No  |
+|  Left | ☐ Yes ☑ No | ☑ Yes ☐ No | ☑ Yes ☐ No  |
+|  Dominant Hand: | ☑ Right ☐ Left |  |   |
+|  ACTIVITY RESTRICTIONS INVOLVING: | Total | Moderate | Mild | No Restriction  |
+| --- | --- | --- | --- | --- |
+|  Fixed/Moving Machinery | ☑ | ☐ | ☐ | ☐  |
+|  Cold Climate | ☐ | ☐ | ☑ | ☐  |
+|  Hot Climate | ☐ | ☑ | ☐ | ☐  |
+|  Wet/Humid | ☐ | ☐ | ☐ | ☑  |
+|  Noise | ☐ | ☑ | ☐ | ☐  |
+|  Dust/Fumes | ☐ | ☐ | ☑ | ☐  |
+|  Use of Powered Equipment | ☐ | ☐ | ☑ | ☐  |
+|  Vibration | ☑ | ☐ | ☐ | ☐  |
+
+## WORK CAPABILITIES
+
+Have you reviewed the patient's job description? ☐ Yes ☑ No
+
+Would job modification enable patient to work with impairment? ☐ Yes ☑ No
+
+Will patient recover sufficiently to perform the essential duties of his/her regular occupation? ☐ Yes ☑ No
+
+Do you know if patient has returned to work? ☐ Yes ☑ No
+If Yes, date 1 2 2018
+mm dd yyyy
+
+Has or will patient recover to return to work as indicated below:
+
+|  Regular occupation, full-time? | ☐ Yes | What date | 5/4/2008 | ☑ No | Estimate | 8/5/2008  |
+| --- | --- | --- | --- | --- | --- | --- |
+|  Regular occupation, part-time? | ☐ Yes | What date | 5/4/2007 | ☑ No | Estimate | 8/8/2008  |
+|  Any other occupation, full-time? | ☑ Yes | What date | 8/14/2018 | ☐ No | Estimate | 4/1/2002  |
+|  Any other occupation, part-time? | ☑ Yes | What date | 4/10/2015 | ☐ No | Estimate | 10/12/2006  |
+
+## CONFIRMATION OF DISABILITY
+
+|  Certify the period that patient is/was continuously Totally Disabled | From 8 mm dd yyyy | Through 4 mm dd yyyy  |
+| --- | --- | --- |
+|  Certify the period that patient is/was continuously Partially Disabled | From 1 mm dd yyyy | Through 8 mm dd yyyy  |
+
+Voluntary Benefits - Disability Income Claim Form (Physician)
+VB-DI-P-17
+Page 4 of 6

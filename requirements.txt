@@ -1,0 +1,32 @@
+# Insurance Claim Search - Prototype Dependencies
+# numpy<2 avoids "module compiled with NumPy 1.x" crash when importing torch
+numpy>=1.26.0,<2
+torch>=2.0.0
+streamlit>=1.28.0
+rank-bm25>=0.2.2
+sentence-transformers>=2.2.0
+transformers>=4.30.0
+faiss-cpu>=1.7.4
+# Optional: persistent vector DB (set VECTOR_BACKEND=chroma in config or env)
+chromadb>=0.4.0
+pdfplumber>=0.10.0
+PyMuPDF>=1.23.0
+pytesseract>=0.3.10
+pdf2image>=1.16.3
+Pillow>=10.0.0
+reportlab>=4.0.0
+# Optional: for AI insight (RAG) - only install if using ChatGPT or Gemini
+openai>=1.0.0
+# New official Gemini SDK (recommended)
+google-genai>=0.1.0
+# Deprecated SDK (still supported as fallback)
+google-generativeai>=0.8.0
+groq>=0.9.0
+python-dotenv>=1.0.0
+# Docling: convert unstructured docs to structured (markdown). Needs numpy<2.
+# Docling (and its layout models) need opencv; pin to a version that works with numpy<2.
+# (opencv-python 4.13+ requires numpy>=2 and conflicts with torch/docling.)
+opencv-python>=4.8,<4.10
+docling>=2.0.0
+# Mistral OCR
+mistralai>=1.0.0

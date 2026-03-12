@@ -1,0 +1,38 @@
+# API keys and secrets (never commit)
+.env
+.env.local
+*.pem
+
+# Virtual environment
+.venv/
+.venv_bge/
+venv/
+env/
+
+# Node
+node_modules/
+
+# ChromaDB / large data
+data/chroma/
+chroma_db/
+
+# Test env (large packages)
+omnidocs_test_env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
