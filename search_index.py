@@ -318,6 +318,51 @@ class SearchIndex:
         reranked.sort(key=lambda x: x[1], reverse=True)
         return reranked[:top_k]
 
+    def verbatim_search(
+        self,
+        query: str,
+        metadata_filter: dict | None = None,
+        max_results: int = 10,
+    ) -> List[Tuple[Chunk, float]]:
+        """
+        Universal: find chunks containing the query (exact or all-keywords).
+        Exact substring first; then soft match (all significant words) so similar
+        queries like "RBI provisioning divergence" find "Divergence in Asset Classification
+        and Provisioning" without requiring exact words. No bias—understands intent.
+        """
+        if not query or not self.chunks:
+            return []
+        q = re.sub(r"\s+", " ", (query or "").strip().lower())
+        if len(q) < 4:
+            return []
+        q_words = [w for w in q.split() if len(w) >= 3]
+        # Skip negation words for soft match: documents may use "un-X" or "non-X" instead of "not X"
+        NEGATION_WORDS = frozenset({"not", "without", "no", "non", "none"})
+        required_words = [w for w in q_words if w not in NEGATION_WORDS] or q_words
+        exact_out = []
+        soft_out = []
+        for c in self.chunks:
+            if not self._chunk_matches_filter(c, metadata_filter):
+                continue
+            text = (c.text or "").lower()
+            pos = text.find(q)
+            if pos != -1:
+                exact_out.append((c, 1.0, pos))
+            elif required_words and all(w in text for w in required_words):
+                first_pos = min(text.find(w) for w in required_words)
+                soft_out.append((c, 0.9, first_pos))
+        exact_out.sort(key=lambda x: (x[2], -len((x[0].text or ""))))
+        soft_out.sort(key=lambda x: (x[2], -len((x[0].text or ""))))
+        seen = set()
+        out = []
+        for c, s, _ in exact_out + soft_out:
+            if c.chunk_id not in seen:
+                seen.add(c.chunk_id)
+                out.append((c, s))
+                if len(out) >= max_results:
+                    break
+        return out
+
     def _chunk_matches_filter(self, chunk: Chunk, metadata_filter: dict | None) -> bool:
         """Return True if chunk matches metadata_filter (or filter is empty)."""
         if not metadata_filter:

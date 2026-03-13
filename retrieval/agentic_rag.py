@@ -151,8 +151,10 @@ OUTPUT FORMAT (valid JSON only, no markdown):
   "reasoning": "Brief explanation of your strategy",
   "intent": "list_entities | get_info | compare | general_search",
   "search_queries": ["query1", "query2", "query3"],
+  "main_intent_keywords": ["phrase1", "phrase2"],
   "scope": "all_patients | specific_patient | unscoped",
   "patient_filter": null or "EXACT patient name from catalog ONLY if explicitly mentioned",
+  "query_type": "text_heavy | image_heavy | hybrid",
   "direct_answer": null,
   "target_attribute": null
 }}
@@ -160,8 +162,14 @@ OUTPUT FORMAT (valid JSON only, no markdown):
 CRITICAL RULES:
 - ONLY set patient_filter if the patient's name is EXPLICITLY MENTIONED in the query.
 - If the query is general (e.g., "diagrams", "arrows", "forms"), do NOT apply any patient filters.
-- Use words that appear in the documents (PHYSICAL CAPACITIES, icd10, ICD-9, treatment, etc.) for text queries.
+- Use words that appear in the documents (PHYSICAL CAPACITIES, icd10, ICD-9, treatment, stand, walk, hours, etc.) for text queries.
 - Use visual descriptors (diagram, chart, arrow, screenshot) for image-seeking queries.
+- main_intent_keywords: CRITICAL for retrieval accuracy. Include BOTH (a) the user's phrasing AND (b) the formal/document way this concept appears (section headers, regulatory terms). Examples:
+  * User: "forex exposure that is not hedged" → include ["unhedged foreign currency exposure", "currency induced credit risk", "forex exposure not hedged"]
+  * User: "RBI provisioning divergence" → include ["divergence in asset classification and provisioning", "RBI provisioning", "provisioning"]
+  * User: "how does the bank handle X" → include the exact section title or regulatory term for X (e.g. "Unhedged Foreign Currency Exposure")
+  Without document-equivalent phrases, similar queries will miss the right chunk. Think: "How would this appear in a formal report or policy document?"
+- query_type: "text_heavy" if answer is in text/narrative, "image_heavy" if in forms/diagrams/charts, "hybrid" if both (e.g. physical capacities form).
 - NEVER refuse or say you can't help."""
 
 
@@ -274,8 +282,10 @@ def _fallback_plan(query: str, catalog: dict) -> dict:
                 return {
                     "intent": "list_entities",
                     "search_queries": [f"{entity} name list", query],
+                    "main_intent_keywords": [entity, "name", "list"],
                     "scope": "all_patients",
                     "patient_filter": None,
+                    "query_type": "text_heavy",
                     "direct_answer": f"{label} in index: " + ", ".join(values),
                     "target_attribute": cat_key,
                 }
@@ -303,7 +313,9 @@ def _fallback_plan(query: str, catalog: dict) -> dict:
         "medication": "medications treatment prescribed drug",
         "claim": "claim claim number claim status benefits",
         "policy": "policy number policy coverage premium",
-        "capacity": "physical capacities stand walk sit lift carry",
+        "capacity": "physical capacities stand walk sit lift carry hours",
+        "stand": "stand walk physical capacities hours total",
+        "hour": "hours stand walk physical capacities total",
         "patient": "Patient Name insured patient information",
         "insurance": "policy number group number claim insured",
         "walk": "walk stand sit lift carry physical capacities",
@@ -323,11 +335,15 @@ def _fallback_plan(query: str, catalog: dict) -> dict:
     if patient_filter:
         queries.append(f"{patient_filter} {query}")
 
+    from .hybrid_fusion import _extract_query_phrases
+    main_kw = _extract_query_phrases(query)
     return {
         "intent": "general_search",
         "search_queries": queries[:3],
+        "main_intent_keywords": main_kw[:6] if main_kw else [],
         "scope": "all_patients" if "all" in q_lower or "every" in q_lower or "each" in q_lower or "patients" in q_lower else "unscoped",
         "patient_filter": patient_filter,
+        "query_type": "text_heavy",
         "direct_answer": None,
         "target_attribute": None,
     }
@@ -355,6 +371,34 @@ def _find_best_chunk_per_patient(patient: str, chunks: list, top_n: int = 1) -> 
     return scored[:top_n]
 
 
+def _expand_queries_with_intent_keywords(
+    search_queries: list[str],
+    main_intent_keywords: list[str] | None,
+    max_extra: int = 3,
+) -> list[str]:
+    """
+    Add document-style phrases from LLM as additional search queries.
+    When user says "forex exposure not hedged", the LLM produces "unhedged foreign currency
+    exposure" — running retrieval for that finds the right chunk. Dynamic, no hardcoding.
+    """
+    if not main_intent_keywords:
+        return search_queries
+    seen = {q.strip().lower() for q in search_queries if q}
+    extra = []
+    # Prefer longer, more specific phrases (likely section headers / formal terms)
+    for kw in sorted(main_intent_keywords, key=lambda x: -len(x)):
+        if not kw or len(kw) < 8:
+            continue
+        k = kw.strip().lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        extra.append(kw.strip())
+        if len(extra) >= max_extra:
+            break
+    return search_queries + extra
+
+
 def _multi_query_retrieve(
     search_queries: list[str],
     text_retriever: Any,
@@ -363,16 +407,22 @@ def _multi_query_retrieve(
     metadata_filter: dict | None,
     retrieve_k: int,
     boost_ocr: bool = False,
+    main_intent_keywords: list[str] | None = None,
 ) -> tuple[list, list]:
     """
     Run multiple search queries and merge results.
-    This is the key to handling any phrasing — different queries catch different angles.
+    Uses main_intent_keywords as additional queries so document-style phrasing
+    (e.g. "unhedged foreign currency exposure") finds the right chunk even when
+    user says "forex exposure not hedged". Dynamic, no hardcoding.
     boost_ocr: when True (text-heavy queries), images with exact query words in OCR rank higher.
     """
+    queries = _expand_queries_with_intent_keywords(
+        search_queries, main_intent_keywords, max_extra=3
+    )
     all_text = {}
     all_image = {}
 
-    for sq in search_queries:
+    for sq in queries:
         text_hits = text_retriever.retrieve(sq, top_k=retrieve_k, metadata_filter=metadata_filter)
         for chunk, score in text_hits:
             cid = chunk.chunk_id
@@ -523,13 +573,17 @@ def run_agentic_rag(
     if not plan:
         plan = _fallback_plan(query, catalog_final)
 
-    # Extract plan fields
+    # Extract plan fields (LLM-derived when available; dynamic for any query/patient)
     intent = plan.get("intent", "general_search")
     search_queries = plan.get("search_queries") or [query]
+    main_intent_keywords = plan.get("main_intent_keywords") or []
     scope = plan.get("scope", "unscoped")
     patient_filter = plan.get("patient_filter")
+    plan_query_type = plan.get("query_type")
     direct_answer = plan.get("direct_answer")
     target_attr = plan.get("target_attribute")
+    main_phrases = main_intent_keywords if main_intent_keywords else None
+    filter_phrases = [patient_filter] if patient_filter else None
 
     # Build metadata filter
     metadata_filter = {}
@@ -541,12 +595,14 @@ def run_agentic_rag(
         prefer_user=PREFER_USER_METADATA_FILTER,
     ) or {}
 
-    # Build understanding dict for UI display
+    # Build understanding dict for UI display (agent understanding page)
     understanding = {
         "intent": intent,
         "metadata_filter": metadata_filter,
         "search_query": search_queries[0] if search_queries else query,
         "search_queries": search_queries,
+        "main_intent_keywords": main_intent_keywords,
+        "query_type": plan_query_type,
         "direct_answer": direct_answer,
         "target_attribute": target_attr,
         "reasoning": plan.get("reasoning", ""),
@@ -573,14 +629,29 @@ def run_agentic_rag(
 
     else:
         # Multi-query semantic search — the core autonomous path
-        query_type = classify_query(query)
+        query_type = plan_query_type if plan_query_type in ("text_heavy", "image_heavy", "hybrid") else classify_query(query)
         text_results, image_results = _multi_query_retrieve(
             search_queries, text_retriever, image_retriever, index,
             metadata_filter=metadata_filter or None,
             retrieve_k=retrieve_k,
             boost_ocr=(query_type == "text_heavy"),
+            main_intent_keywords=main_intent_keywords,
         )
-        text_results = boost_phrase_matching(text_results, query)
+        verbatim = []
+        if index and hasattr(index, "verbatim_search"):
+            verbatim = index.verbatim_search(query, metadata_filter or None, max_results=10)
+            # Also search for document-style phrases from LLM (section headers, formal terms)
+            for kw in (main_intent_keywords or [])[:3]:
+                if kw and len(kw) >= 8:
+                    v_kw = index.verbatim_search(kw, metadata_filter or None, max_results=5)
+                    for c, s in v_kw:
+                        if c.chunk_id not in {x.chunk_id for x, _ in verbatim}:
+                            verbatim.append((c, s))
+        seen_ids = {c.chunk_id for c, _ in verbatim}
+        text_results = list(verbatim) + [(c, s) for c, s in text_results if c.chunk_id not in seen_ids]
+        main_phrases = main_intent_keywords if main_intent_keywords else None
+        filter_phrases = [patient_filter] if patient_filter else None
+        text_results = boost_phrase_matching(text_results, query, main_phrases_override=main_phrases, filter_phrases_override=filter_phrases)
         fuse_top_k = retrieve_k if METADATA_DIVERSITY_ENABLED else MULTIMODAL_HYBRID_TOP_K
         fused = fuse_results(text_results, image_results, query_type, top_k=fuse_top_k)
 
@@ -610,8 +681,19 @@ def run_agentic_rag(
             [query] + search_queries[:1], text_retriever, image_retriever, index,
             metadata_filter=None, retrieve_k=retrieve_k,
             boost_ocr=(query_type == "text_heavy"),
+            main_intent_keywords=main_intent_keywords,
         )
-        fallback_text = boost_phrase_matching(fallback_text, query)
+        if index and hasattr(index, "verbatim_search"):
+            v_fb = index.verbatim_search(query, None, max_results=10)
+            for kw in (main_intent_keywords or [])[:3]:
+                if kw and len(kw) >= 8:
+                    v_kw = index.verbatim_search(kw, None, max_results=5)
+                    for c, s in v_kw:
+                        if c.chunk_id not in {x.chunk_id for x, _ in v_fb}:
+                            v_fb.append((c, s))
+            seen_fb = {c.chunk_id for c, _ in v_fb}
+            fallback_text = list(v_fb) + [(c, s) for c, s in fallback_text if c.chunk_id not in seen_fb]
+        fallback_text = boost_phrase_matching(fallback_text, query, main_phrases_override=main_phrases, filter_phrases_override=filter_phrases)
         fallback_fused = fuse_results(fallback_text, fallback_image, query_type, top_k=retrieve_k)
 
         active_patient = (metadata_filter or {}).get("patient_name", "").lower()

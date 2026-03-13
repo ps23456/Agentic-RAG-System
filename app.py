@@ -912,6 +912,10 @@ def main():
                     fused = [{"type": "text", "content": c, "final_score": s} for c, s in text_results]
                 else:
                     text_results = text_retriever.retrieve(search_query_mh, top_k=retrieve_k, metadata_filter=metadata_filter_mh or None)
+                    if index and hasattr(index, "verbatim_search"):
+                        verbatim = index.verbatim_search(query_mh, metadata_filter_mh or None, max_results=10)
+                        seen_v = {c.chunk_id for c, _ in verbatim}
+                        text_results = list(verbatim) + [(c, s) for c, s in text_results if c.chunk_id not in seen_v]
                     text_results = boost_phrase_matching(text_results, query_mh)
                     image_results = image_retriever.retrieve(search_query_mh, top_n=30, metadata_filter=metadata_filter_mh or None)
                     fuse_top_k = retrieve_k if METADATA_DIVERSITY_ENABLED else MULTIMODAL_HYBRID_TOP_K
@@ -925,10 +929,22 @@ def main():
             text_results = [(r["content"], r["final_score"]) for r in fused if r["type"] == "text"]
             image_results = [(r["content"], r["final_score"]) for r in fused if r["type"] == "image"]
 
-        query_type = classify_query(query_mh)
+        query_type = (
+            understanding_mh.get("query_type")
+            if (use_agentic_rag and understanding_mh and understanding_mh.get("query_type") in ("text_heavy", "image_heavy", "hybrid"))
+            else classify_query(query_mh)
+        )
         weights = MULTIMODAL_HYBRID_WEIGHTS.get(query_type, (0.5, 0.5))
         st.subheader("Multimodal Hybrid Results" + (" (Agentic)" if use_agentic_rag else ""))
         st.caption("Fused ranking: text (BM25 + dense + rerank) + image (CLIP). Query type: **%s** · Weights: text=%.2f, image=%.2f" % (query_type, weights[0], weights[1]))
+        if use_agentic_rag and understanding_mh:
+            with st.expander("Agent understanding", expanded=False):
+                if understanding_mh.get("reasoning"):
+                    st.write("**Reasoning:**", understanding_mh["reasoning"])
+                st.write("**Intent:**", understanding_mh.get("intent", "—"))
+                if understanding_mh.get("main_intent_keywords"):
+                    st.write("**Main intent:**", ", ".join(understanding_mh["main_intent_keywords"]))
+                st.write("**Search queries:**", understanding_mh.get("search_queries", []))
         answer_to_show = direct_answer
         if answer_to_show:
             st.success("**" + answer_to_show + "**")
@@ -955,7 +971,11 @@ def main():
             for i, row in enumerate(fused[:10], start=1):
                 if row["type"] == "text":
                     chunk = row["content"]
-                    st.markdown("**%d. %s**" % (i, getattr(chunk, "file_name", "")) + (f" (p.{getattr(chunk, 'page_number', 0)})" if getattr(chunk, "page_number", 0) else ""))
+                    chunk_text = (getattr(chunk, "text", "") or "").lower()
+                    query_norm = re.sub(r"\s+", " ", (query_mh or "").strip().lower())
+                    is_exact = i == 1 and len(query_norm) >= 10 and query_norm in chunk_text
+                    exact_badge = " · **Exact match**" if is_exact else ""
+                    st.markdown("**%d. %s**" % (i, getattr(chunk, "file_name", "")) + (f" (p.{getattr(chunk, 'page_number', 0)})" if getattr(chunk, "page_number", 0) else "") + exact_badge)
                     # If this text comes from an image file (e.g. JPG), show the image as well as the OCR text
                     fname = getattr(chunk, "file_name", "") or ""
                     if fname and os.path.splitext(fname)[1].lower() in (".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"):
@@ -966,12 +986,11 @@ def main():
                                     st.image(img_path, use_container_width=True)
                                     st.caption("Image (source of text below)")
                                 break
-                    chunk_text = chunk.text or ""
-                    display_text = chunk_text
+                    display_text = getattr(chunk, "text", "") or ""
                     page_num = getattr(chunk, "page_number", 0) or 1
                     found_page = page_num
                     phrases = _extract_query_phrases(query_mh)
-                    has_phrase = any(p and len(p) >= 3 and p in (chunk_text or "").lower() for p in phrases)
+                    has_phrase = any(p and len(p) >= 3 and p in chunk_text for p in phrases)
                     if not has_phrase and fname and fname.lower().endswith(".pdf") and page_num:
                         for root, _dirs, files in os.walk(data_folder):
                             if fname in files:

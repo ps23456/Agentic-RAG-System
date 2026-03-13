@@ -51,6 +51,10 @@ def run_multimodal_hybrid(
     image_retriever = ImageRetriever()
 
     text_results = text_retriever.retrieve(query, top_k=top_k)
+    if text_index and hasattr(text_index, "verbatim_search"):
+        verbatim = text_index.verbatim_search(query, None, max_results=10)
+        seen_v = {c.chunk_id for c, _ in verbatim}
+        text_results = list(verbatim) + [(c, s) for c, s in text_results if c.chunk_id not in seen_v]
     text_results = boost_phrase_matching(text_results, query)
     image_results = image_retriever.retrieve(query, top_n=20)
 

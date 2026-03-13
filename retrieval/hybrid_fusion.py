@@ -62,18 +62,36 @@ def _extract_main_intent_phrases(query: str) -> Tuple[List[str], List[str]]:
 def boost_phrase_matching(
     text_results: List[Tuple[Any, float]],
     query: str,
+    main_phrases_override: List[str] | None = None,
+    filter_phrases_override: List[str] | None = None,
 ) -> List[Tuple[Any, float]]:
     """
-    Intent-aware boost: MAIN PRIORITY = chunks matching what user wants (e.g. "primary diagnosis");
-    NEXT PRIORITY = chunks matching filter/scope (e.g. "teresa brown"). Non-matching last.
+    Intent-aware boost: MAIN PRIORITY = chunks matching what user wants;
+    NEXT PRIORITY = chunks matching filter/scope. Non-matching last.
+    When main_phrases_override/filter_phrases_override are provided (from LLM), use those
+    for dynamic, query-agnostic understanding. Otherwise fall back to regex parsing.
     """
     if not query or not text_results:
         return text_results
-    main_phrases, filter_phrases = _extract_main_intent_phrases(query)
-    all_phrases = main_phrases + [p for p in filter_phrases if p not in main_phrases]
-    if not all_phrases:
+    if main_phrases_override is not None or filter_phrases_override is not None:
+        main_phrases = main_phrases_override or []
+        filter_phrases = filter_phrases_override or []
+        all_phrases = main_phrases + [p for p in filter_phrases if p and p not in main_phrases]
+        if not main_phrases and not filter_phrases:
+            main_phrases, filter_phrases = _extract_main_intent_phrases(query)
+            all_phrases = main_phrases + [p for p in filter_phrases if p not in main_phrases]
+    else:
+        main_phrases, filter_phrases = _extract_main_intent_phrases(query)
+        all_phrases = main_phrases + [p for p in filter_phrases if p not in main_phrases]
+    if not all_phrases and not main_phrases and not filter_phrases:
         return text_results
 
+    query_norm = re.sub(r"\s+", " ", (query or "").strip().lower())
+    query_min_len = 10
+    # Core query: longest phrase from all_phrases (handles "i want X" -> X is core)
+    core_phrases = sorted([p for p in all_phrases if len(p) >= 15], key=len, reverse=True)
+
+    tier0 = []  # verbatim: chunk contains full query or core phrase (exact chunk for any query)
     tier1 = []  # matches main intent
     tier2 = []  # matches filter only
     tier3 = []  # no match
@@ -84,7 +102,14 @@ def boost_phrase_matching(
         main_matched = [p for p in main_phrases if p in text]
         filter_matched = [p for p in filter_phrases if p in text and p not in main_phrases]
 
-        if main_matched:
+        verbatim = (
+            (len(query_norm) >= query_min_len and query_norm in text)
+            or any(cp in text for cp in core_phrases[:3])
+        )
+
+        if verbatim:
+            tier0.append((item, len(query_norm), score))
+        elif main_matched:
             longest_main = max(len(p) for p in main_matched)
             n_main = len(main_matched)
             tier1.append((item, longest_main, n_main, len(filter_matched), score))
@@ -94,9 +119,10 @@ def boost_phrase_matching(
         else:
             tier3.append(item)
 
+    tier0.sort(key=lambda x: (-x[1], -x[2]))
     tier1.sort(key=lambda x: (-x[1], -x[2], -x[3], -x[4]))
     tier2.sort(key=lambda x: (-x[1], -x[2]))
-    return [t[0] for t in tier1] + [t[0] for t in tier2] + tier3
+    return [t[0] for t in tier0] + [t[0] for t in tier1] + [t[0] for t in tier2] + tier3
 
 
 def normalize_scores(scores: List[float], eps: float = 1e-8) -> List[float]:
