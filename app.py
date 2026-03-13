@@ -76,7 +76,15 @@ from config import (
     METADATA_DIVERSITY_CANDIDATES,
     LLM_QUERY_UNDERSTANDING,
 )
-from document_loader import load_and_chunk_folder, get_ocr_status, count_image_files_in_folder, set_mistral_ocr_key, get_mistral_ocr_key
+from document_loader import (
+    load_and_chunk_folder,
+    get_ocr_status,
+    count_image_files_in_folder,
+    set_mistral_ocr_key,
+    get_mistral_ocr_key,
+    extract_text_from_pdf_page,
+    find_pdf_page_containing_phrases,
+)
 from search_index import SearchIndex
 from llm_insight import (
     get_insight,
@@ -96,7 +104,7 @@ from retrieval.query_metadata_extractor import (
 )
 from retrieval.text_retriever import TextRetriever
 from retrieval.image_retriever import ImageRetriever
-from retrieval.hybrid_fusion import fuse_results
+from retrieval.hybrid_fusion import fuse_results, boost_phrase_matching
 from retrieval.result_diversifier import diversify_by_metadata, diversify_fused_results
 from retrieval.llm_query_understanding import understand_query_llm, detect_list_patients_intent
 from retrieval.agentic_rag import run_agentic_rag, get_robust_catalog
@@ -111,13 +119,29 @@ def _check_pytorch():
         return False, str(e)
 
 
+def _extract_query_phrases(query: str) -> list[str]:
+    """Extract meaningful 2–4 word phrases from query for snippet matching (skip stopwords)."""
+    stop = {"a", "an", "the", "of", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "could", "should",
+            "may", "might", "must", "shall", "can", "need", "to", "for", "in", "on", "at",
+            "by", "with", "from", "as", "into", "through", "during", "before", "after"}
+    words = re.findall(r"\b[a-zA-Z0-9]+\b", (query or "").lower())
+    phrases = []
+    for n in range(4, 1, -1):  # Prefer longer phrases first
+        for i in range(len(words) - n + 1):
+            span = words[i : i + n]
+            if not any(w in stop for w in span) or n >= 3:
+                phrases.append(" ".join(span))
+    return phrases
+
+
 def snippet(text: str, query: str | None = None, max_len: int = 400) -> str:
     """
     Build a short snippet for display.
 
     If a query is provided, try to center the snippet around the first occurrence
-    of the query phrase (case-insensitive). This helps show the most relevant
-    part of a long chunk instead of boilerplate at the top of the page.
+    of any meaningful phrase from the query (e.g. "primary diagnosis", "teresa brown").
+    This shows the most relevant part instead of boilerplate at the top.
     """
     if not text:
         return ""
@@ -126,27 +150,48 @@ def snippet(text: str, query: str | None = None, max_len: int = 400) -> str:
         return flat
 
     if query:
-        q = query.strip().lower()
-        if q:
-            idx = flat.lower().find(q)
-            if idx != -1:
-                # Center window around the match
-                start = max(0, idx - max_len // 3)
-                end = min(len(flat), start + max_len)
-                window = flat[start:end]
-                # Add ellipses if we cut from middle
-                prefix = "..." if start > 0 else ""
-                suffix = "..." if end < len(flat) else ""
-                return prefix + window.strip() + suffix
+        phrases = _extract_query_phrases(query)
+        flat_lower = flat.lower()
+        best_idx = -1
+        best_len = 0
+        for p in phrases:
+            if len(p) < 3:
+                continue
+            idx = flat_lower.find(p)
+            if idx != -1 and len(p) > best_len:
+                best_idx = idx
+                best_len = len(p)
+        if best_idx != -1:
+            start = max(0, best_idx - max_len // 3)
+            end = min(len(flat), start + max_len)
+            window = flat[start:end]
+            prefix = "..." if start > 0 else ""
+            suffix = "..." if end < len(flat) else ""
+            return prefix + window.strip() + suffix
 
     # Fallback: simple prefix
     return flat[: max_len - 3].rsplit(" ", 1)[0] + "..."
 
 
-def render_result(chunk, score: float, score_label: str, idx: int, query: str | None = None):
+def render_result(chunk, score: float, score_label: str, idx: int, query: str | None = None, data_folder: str | None = None):
     st.markdown(f"**{idx}. {chunk.file_name}**" + (f" (p.{chunk.page_number})" if chunk.page_number else ""))
-    st.caption(f"{score_label}: {score:.4f}  ·  Type: {chunk.document_type}  ·  ID: `{chunk.chunk_id}`")
-    st.text(snippet(chunk.text, query=query))
+    chunk_text = chunk.text or ""
+    display_text = chunk_text
+    found_page = chunk.page_number
+    if data_folder and query and chunk.file_name and chunk.file_name.lower().endswith(".pdf") and chunk.page_number:
+        phrases = _extract_query_phrases(query)
+        if not any(p and len(p) >= 3 and p in chunk_text.lower() for p in phrases):
+            for root, _dirs, files in os.walk(data_folder):
+                if chunk.file_name in files:
+                    pdf_path = os.path.join(root, chunk.file_name)
+                    if os.path.isfile(pdf_path):
+                        found_page, page_text = find_pdf_page_containing_phrases(pdf_path, phrases, start_page=chunk.page_number)
+                        if page_text:
+                            display_text = page_text
+                    break
+    ctx_hint = f" · Context from p.{found_page}" if found_page and found_page != chunk.page_number else ""
+    st.caption(f"{score_label}: {score:.4f}  ·  Type: {chunk.document_type}  ·  ID: `{chunk.chunk_id}`{ctx_hint}")
+    st.text(snippet(display_text, query=query))
     st.divider()
 
 
@@ -595,7 +640,7 @@ def main():
                 st.info("No exact keyword matches for this query. Try terms that appear in your documents (e.g. claim ID, policy clause).")
             else:
                 for i, (chunk, score) in enumerate(bm25_hits, start=1):
-                    render_result(chunk, score, "Rerank score" if use_reranker else "BM25 score", i, query=query)
+                    render_result(chunk, score, "Rerank score" if use_reranker else "BM25 score", i, query=query, data_folder=data_folder)
 
         with col2:
             st.markdown("### 2️⃣ Vector Results" + (" + Reranked" if use_reranker else ""))
@@ -604,7 +649,7 @@ def main():
                 st.info("No confident semantic matches. Try different terms or add more documents (including image text via Tesseract).")
             else:
                 for i, (chunk, score) in enumerate(vector_hits, start=1):
-                    render_result(chunk, score, "Rerank score" if use_reranker else "Similarity", i, query=query)
+                    render_result(chunk, score, "Rerank score" if use_reranker else "Similarity", i, query=query, data_folder=data_folder)
 
         with col3:
             st.markdown("### 3️⃣ Hybrid Results (RRF)" + (" + Reranked" if use_reranker else ""))
@@ -613,7 +658,7 @@ def main():
                 st.info("No confident hybrid matches. Use keywords from your docs or index more files (e.g. image text with Tesseract).")
             else:
                 for i, (chunk, score) in enumerate(hybrid_hits, start=1):
-                    render_result(chunk, score, "Rerank score" if use_reranker else "Fusion score", i, query=query)
+                    render_result(chunk, score, "Rerank score" if use_reranker else "Fusion score", i, query=query, data_folder=data_folder)
 
         st.divider()
         st.caption("Retrieval-only prototype. Results are from your indexed documents; no generated answers.")
@@ -867,6 +912,7 @@ def main():
                     fused = [{"type": "text", "content": c, "final_score": s} for c, s in text_results]
                 else:
                     text_results = text_retriever.retrieve(search_query_mh, top_k=retrieve_k, metadata_filter=metadata_filter_mh or None)
+                    text_results = boost_phrase_matching(text_results, query_mh)
                     image_results = image_retriever.retrieve(search_query_mh, top_n=30, metadata_filter=metadata_filter_mh or None)
                     fuse_top_k = retrieve_k if METADATA_DIVERSITY_ENABLED else MULTIMODAL_HYBRID_TOP_K
                     fused = fuse_results(text_results, image_results, query_type, top_k=fuse_top_k)
@@ -910,7 +956,6 @@ def main():
                 if row["type"] == "text":
                     chunk = row["content"]
                     st.markdown("**%d. %s**" % (i, getattr(chunk, "file_name", "")) + (f" (p.{getattr(chunk, 'page_number', 0)})" if getattr(chunk, "page_number", 0) else ""))
-                    st.caption("Fused score: %.4f · Text" % row["final_score"])
                     # If this text comes from an image file (e.g. JPG), show the image as well as the OCR text
                     fname = getattr(chunk, "file_name", "") or ""
                     if fname and os.path.splitext(fname)[1].lower() in (".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"):
@@ -921,7 +966,23 @@ def main():
                                     st.image(img_path, use_container_width=True)
                                     st.caption("Image (source of text below)")
                                 break
-                    st.text(snippet(chunk.text or "", query=query_mh))
+                    chunk_text = chunk.text or ""
+                    display_text = chunk_text
+                    page_num = getattr(chunk, "page_number", 0) or 1
+                    found_page = page_num
+                    phrases = _extract_query_phrases(query_mh)
+                    has_phrase = any(p and len(p) >= 3 and p in (chunk_text or "").lower() for p in phrases)
+                    if not has_phrase and fname and fname.lower().endswith(".pdf") and page_num:
+                        for root, _dirs, files in os.walk(data_folder):
+                            if fname in files:
+                                pdf_path = os.path.join(root, fname)
+                                if os.path.isfile(pdf_path):
+                                    found_page, page_text = find_pdf_page_containing_phrases(pdf_path, phrases, start_page=page_num)
+                                    if page_text:
+                                        display_text = page_text
+                                break
+                    st.caption("Fused score: %.4f · Text" % row["final_score"] + (f" · Context from p.{found_page}" if found_page != page_num else ""))
+                    st.text(snippet(display_text, query=query_mh))
                 else:
                     item = row["content"]
                     st.markdown("**%d. %s**" % (i, item.get("file_name", "")) + (f" (p.{item.get('page', '')})" if item.get("page") else ""))

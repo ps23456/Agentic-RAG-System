@@ -33,7 +33,7 @@ _STOPWORDS = frozenset({
 
 
 def _ocr_text_relevance(query: str, ocr_text: str) -> float:
-    """Score how relevant the OCR text is to the query using keyword overlap + phrase proximity."""
+    """Score how relevant the OCR text is to the query using keyword overlap + phrase proximity + exact phrase boost."""
     if not ocr_text or not query:
         return 0.0
     q_words = list(dict.fromkeys(w for w in re.findall(r"[a-z]{2,}", query.lower()) if w not in _STOPWORDS))
@@ -61,7 +61,20 @@ def _ocr_text_relevance(query: str, ocr_text: str) -> float:
         if bigrams_total > 0:
             phrase_bonus = 0.3 * (bigrams_found / bigrams_total)
 
-    return base_score + phrase_bonus
+    # Exact phrase boost: when a multi-word phrase from the query appears verbatim in OCR, strong boost
+    # (e.g. "primary diagnosis" in query and OCR -> image with exact words ranks higher)
+    exact_phrase_bonus = 0.0
+    if len(q_words) >= 2:
+        for n in range(min(4, len(q_words)), 1, -1):  # Check 4-word, 3-word, 2-word phrases
+            for i in range(len(q_words) - n + 1):
+                phrase = " ".join(q_words[i:i + n])
+                if phrase in ocr_lower:
+                    exact_phrase_bonus = 0.5 + 0.1 * n  # 2-word: +0.6, 3-word: +0.7, 4-word: +0.8
+                    break
+            if exact_phrase_bonus > 0:
+                break
+
+    return base_score + phrase_bonus + exact_phrase_bonus
 
 _clip_model = None
 _clip_processor = None
@@ -110,6 +123,7 @@ class ImageRetriever:
         query: str,
         top_n: int | None = None,
         metadata_filter: dict | None = None,
+        boost_ocr: bool = False,
     ) -> List[Tuple[Dict[str, Any], float]]:
         """
         Returns list of (image_item, similarity_score).
@@ -181,8 +195,9 @@ class ImageRetriever:
             clip_score = max(0.0, 1.0 - dist)
             ocr_text = meta.get("ocr_text", "") or ""
             ocr_rel = _ocr_text_relevance(query, ocr_text)
-            # Blend CLIP visual similarity with OCR text relevance (40% OCR boost when text matches)
-            score = clip_score + 0.4 * ocr_rel if ocr_text else clip_score
+            # Blend CLIP with OCR: higher OCR weight when boost_ocr (text-heavy queries) so images with exact words rank first
+            ocr_weight = 0.65 if boost_ocr else 0.4
+            score = clip_score + ocr_weight * ocr_rel if ocr_text else clip_score
             item = {
                 "id": uid,
                 "file_name": meta.get("file_name", ""),

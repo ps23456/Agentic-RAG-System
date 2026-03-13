@@ -27,6 +27,9 @@ from document_loader import (
 
 _VLM_DESCRIPTION_MIN_OCR_LEN = 150
 
+# Keywords that suggest a medical/insurance form (triggers section-header vision description)
+_FORM_LIKE_KEYWORDS = ("patient", "diagnosis", "claim", "physician", "disability", "restriction", "primary", "secondary")
+
 
 def _vlm_describe_image(pil_image) -> str:
     """Use Groq VLM to generate a text description of an image when OCR text is too short."""
@@ -60,6 +63,47 @@ def _vlm_describe_image(pil_image) -> str:
     except Exception as e:
         logger.warning("VLM describe failed: %s", e)
     return ""
+
+
+def _vlm_describe_form_sections(pil_image) -> str:
+    """Use vision model to list section headers in a form – helps queries like 'primary diagnosis' find the right page."""
+    import base64, io, os
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        return ""
+    try:
+        buf = io.BytesIO()
+        pil_image.save(buf, format="JPEG", quality=80)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        import requests
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "This image appears to be a medical or insurance form. List the main section headers and key fields visible (e.g. Primary Diagnosis, Secondary Diagnosis, Patient Name, Physical Capacities, restrictions, dates). Include exact phrases you see. Keep under 150 words."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ]}],
+                "max_tokens": 200,
+            },
+            timeout=25,
+        )
+        if resp.status_code == 200:
+            desc = resp.json()["choices"][0]["message"]["content"]
+            logger.info("VLM form sections generated (%d chars)", len(desc))
+            return desc
+    except Exception as e:
+        logger.warning("VLM form sections failed: %s", e)
+    return ""
+
+
+def _looks_like_form(ocr_text: str) -> bool:
+    """Heuristic: OCR contains form-like keywords."""
+    if not ocr_text or len(ocr_text) < 20:
+        return False
+    lower = ocr_text.lower()
+    return any(kw in lower for kw in _FORM_LIKE_KEYWORDS)
 
 
 def _normalize_name(name: str) -> str:
@@ -162,6 +206,11 @@ def _collect_image_items(data_folder: str, existing_mtimes: dict[str, float] | N
                             vlm_desc = _vlm_describe_image(img)
                             if vlm_desc:
                                 ocr_text = ocr_text + "\n\n" + vlm_desc if ocr_text.strip() else vlm_desc
+                        elif _looks_like_form(ocr_text):
+                            # Vision model lists section headers for form-like images – helps "primary diagnosis" etc.
+                            form_desc = _vlm_describe_form_sections(img)
+                            if form_desc:
+                                ocr_text = ocr_text + "\n\n[Section headers: " + form_desc + "]"
                         patient_from_path, report_type = _extract_medical_report_metadata(path, data_folder)
                         patient_name = patient_from_path or (doc_meta.get("patient_name", "") or "")
                         items.append({
@@ -212,6 +261,14 @@ def _collect_image_items(data_folder: str, existing_mtimes: dict[str, float] | N
                             continue
                         seen.add(uid)
                         page_ocr = pdf_text_map.get(page_num + 1, "")
+                        if len(page_ocr.strip()) < _VLM_DESCRIPTION_MIN_OCR_LEN:
+                            vlm_desc = _vlm_describe_image(pil_img)
+                            if vlm_desc:
+                                page_ocr = page_ocr + "\n\n" + vlm_desc if page_ocr.strip() else vlm_desc
+                        elif _looks_like_form(page_ocr):
+                            form_desc = _vlm_describe_form_sections(pil_img)
+                            if form_desc:
+                                page_ocr = page_ocr + "\n\n[Section headers: " + form_desc + "]"
                         patient_from_path, report_type = _extract_medical_report_metadata(path, data_folder)
                         patient_name = patient_from_path or (doc_meta.get("patient_name", "") or "")
                         items.append({

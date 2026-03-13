@@ -16,7 +16,7 @@ from indexing.image_indexer import build_image_index
 from retrieval.query_classifier import QueryClassifier, classify_query
 from retrieval.text_retriever import TextRetriever
 from retrieval.image_retriever import ImageRetriever
-from retrieval.hybrid_fusion import fuse_results
+from retrieval.hybrid_fusion import fuse_results, boost_phrase_matching
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -51,6 +51,7 @@ def run_multimodal_hybrid(
     image_retriever = ImageRetriever()
 
     text_results = text_retriever.retrieve(query, top_k=top_k)
+    text_results = boost_phrase_matching(text_results, query)
     image_results = image_retriever.retrieve(query, top_n=20)
 
     fused = fuse_results(text_results, image_results, query_type, top_k=top_k)

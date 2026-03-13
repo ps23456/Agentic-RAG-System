@@ -1,10 +1,102 @@
 """
 Score normalization (min-max) and weighted fusion for Multimodal Hybrid RAG.
-No heuristic boosting; proper normalized score fusion.
+Includes phrase-match boost: chunks containing query key phrases rank higher (universal solution).
 """
-from typing import List, Tuple, Any, Dict
+import re
+from typing import Any, Dict, List, Tuple
 
 from config import MULTIMODAL_HYBRID_WEIGHTS, MULTIMODAL_HYBRID_TOP_K
+
+
+def _extract_query_phrases(query: str) -> List[str]:
+    """Extract meaningful 2–4 word phrases for retrieval boosting (skip stopwords)."""
+    stop = {"a", "an", "the", "of", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "could", "should",
+            "may", "might", "must", "shall", "can", "need", "to", "for", "in", "on", "at",
+            "by", "with", "from", "as", "into", "through", "during", "before", "after"}
+    words = re.findall(r"\b[a-zA-Z0-9]+\b", (query or "").lower())
+    phrases = []
+    for n in range(4, 1, -1):
+        for i in range(len(words) - n + 1):
+            span = words[i : i + n]
+            if not any(w in stop for w in span) or n >= 3:
+                phrases.append(" ".join(span))
+    return phrases
+
+
+def _extract_main_intent_phrases(query: str) -> Tuple[List[str], List[str]]:
+    """
+    Parse query to separate MAIN INTENT (what user wants) vs FILTER/SCOPE (who/which).
+    E.g. "primary diagnosis of teresa brown" -> main=["primary diagnosis"], filter=["teresa brown"]
+    Chunks matching main intent rank above those matching only filter.
+    """
+    q = (query or "").strip().lower()
+    main_phrases: List[str] = []
+    filter_phrases: List[str] = []
+    all_phrases = _extract_query_phrases(query)
+
+    # Patterns: "X of Y", "X for Y", "Y's X" -> X is main intent, Y is filter
+    m = re.search(r"^(.+?)\s+of\s+(.+)$", q)
+    if m:
+        main_phrases.extend(p for p in all_phrases if p and p in m.group(1).lower() and len(p) >= 3)
+        filter_phrases.extend(p for p in all_phrases if p and p in m.group(2).lower() and len(p) >= 3)
+    if not main_phrases and not filter_phrases:
+        m = re.search(r"^(.+?)\s+for\s+(.+)$", q)
+        if m:
+            main_phrases.extend(p for p in all_phrases if p and p in m.group(1).lower() and len(p) >= 3)
+            filter_phrases.extend(p for p in all_phrases if p and p in m.group(2).lower() and len(p) >= 3)
+    if not main_phrases and not filter_phrases:
+        m = re.search(r"^(.+?)'s\s+(.+)$", q)
+        if m:
+            main_phrases.extend(p for p in all_phrases if p and p in m.group(2).lower() and len(p) >= 3)
+            filter_phrases.extend(p for p in all_phrases if p and p in m.group(1).lower() and len(p) >= 3)
+
+    if not main_phrases:
+        main_phrases = [p for p in all_phrases if p and len(p) >= 3]
+    if not filter_phrases:
+        filter_phrases = []
+
+    return main_phrases, filter_phrases
+
+
+def boost_phrase_matching(
+    text_results: List[Tuple[Any, float]],
+    query: str,
+) -> List[Tuple[Any, float]]:
+    """
+    Intent-aware boost: MAIN PRIORITY = chunks matching what user wants (e.g. "primary diagnosis");
+    NEXT PRIORITY = chunks matching filter/scope (e.g. "teresa brown"). Non-matching last.
+    """
+    if not query or not text_results:
+        return text_results
+    main_phrases, filter_phrases = _extract_main_intent_phrases(query)
+    all_phrases = main_phrases + [p for p in filter_phrases if p not in main_phrases]
+    if not all_phrases:
+        return text_results
+
+    tier1 = []  # matches main intent
+    tier2 = []  # matches filter only
+    tier3 = []  # no match
+
+    for item in text_results:
+        chunk, score = item
+        text = (getattr(chunk, "text", "") or "").lower()
+        main_matched = [p for p in main_phrases if p in text]
+        filter_matched = [p for p in filter_phrases if p in text and p not in main_phrases]
+
+        if main_matched:
+            longest_main = max(len(p) for p in main_matched)
+            n_main = len(main_matched)
+            tier1.append((item, longest_main, n_main, len(filter_matched), score))
+        elif filter_matched:
+            longest_filter = max(len(p) for p in filter_matched)
+            tier2.append((item, longest_filter, score))
+        else:
+            tier3.append(item)
+
+    tier1.sort(key=lambda x: (-x[1], -x[2], -x[3], -x[4]))
+    tier2.sort(key=lambda x: (-x[1], -x[2]))
+    return [t[0] for t in tier1] + [t[0] for t in tier2] + tier3
 
 
 def normalize_scores(scores: List[float], eps: float = 1e-8) -> List[float]:
@@ -64,8 +156,10 @@ def fuse_results(
         else:
             if rrf_score > registry[key]["image_rrf"]:
                 registry[key]["image_rrf"] = rrf_score
-            # Prefer image item as primary content for display
-            registry[key]["content"] = img_item
+            # For text_heavy queries, prefer text so user sees actual content (e.g. from Markdown)
+            # For image_heavy/hybrid, prefer image for visual context
+            if query_type != "text_heavy":
+                registry[key]["content"] = img_item
 
     # Calculate final scores
     fused = []
@@ -77,6 +171,9 @@ def fuse_results(
         t_rrf = data["text_rrf"]
         i_rrf = data["image_rrf"]
         
+        # For text_heavy: exclude image-only results so we never show images for text queries
+        if query_type == "text_heavy" and t_rrf <= 0:
+            continue
         final = (w_text * t_rrf) + (w_image * i_rrf)
         
         fused.append({

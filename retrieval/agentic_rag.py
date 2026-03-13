@@ -362,10 +362,12 @@ def _multi_query_retrieve(
     index: Any,
     metadata_filter: dict | None,
     retrieve_k: int,
+    boost_ocr: bool = False,
 ) -> tuple[list, list]:
     """
     Run multiple search queries and merge results.
     This is the key to handling any phrasing — different queries catch different angles.
+    boost_ocr: when True (text-heavy queries), images with exact query words in OCR rank higher.
     """
     all_text = {}
     all_image = {}
@@ -377,7 +379,7 @@ def _multi_query_retrieve(
             if cid not in all_text or score > all_text[cid][1]:
                 all_text[cid] = (chunk, score)
 
-        image_hits = image_retriever.retrieve(sq, top_n=20, metadata_filter=metadata_filter)
+        image_hits = image_retriever.retrieve(sq, top_n=20, metadata_filter=metadata_filter, boost_ocr=boost_ocr)
         for item, score in image_hits:
             key = (item.get("file_name", ""), item.get("page", ""))
             if key not in all_image or score > all_image[key][1]:
@@ -489,7 +491,7 @@ def run_agentic_rag(
     3. Guarantees minimum results via fallback
     """
     from .query_metadata_extractor import merge_metadata_filters
-    from .hybrid_fusion import fuse_results
+    from .hybrid_fusion import fuse_results, boost_phrase_matching
     from .result_diversifier import diversify_fused_results
     from .query_classifier import classify_query
 
@@ -571,12 +573,14 @@ def run_agentic_rag(
 
     else:
         # Multi-query semantic search — the core autonomous path
+        query_type = classify_query(query)
         text_results, image_results = _multi_query_retrieve(
             search_queries, text_retriever, image_retriever, index,
             metadata_filter=metadata_filter or None,
             retrieve_k=retrieve_k,
+            boost_ocr=(query_type == "text_heavy"),
         )
-        query_type = classify_query(query)
+        text_results = boost_phrase_matching(text_results, query)
         fuse_top_k = retrieve_k if METADATA_DIVERSITY_ENABLED else MULTIMODAL_HYBRID_TOP_K
         fused = fuse_results(text_results, image_results, query_type, top_k=fuse_top_k)
 
@@ -596,6 +600,7 @@ def run_agentic_rag(
 
     # Step 4: Guarantee minimum results — retry broader if too few
     if len(fused) < MIN_RESULTS and index and index.chunks:
+        query_type = classify_query(query)  # Ensure set for fallback (list_entities path may not set it)
         existing_ids = set()
         for r in fused:
             c = r["content"]
@@ -604,8 +609,9 @@ def run_agentic_rag(
         fallback_text, fallback_image = _multi_query_retrieve(
             [query] + search_queries[:1], text_retriever, image_retriever, index,
             metadata_filter=None, retrieve_k=retrieve_k,
+            boost_ocr=(query_type == "text_heavy"),
         )
-        query_type = classify_query(query)
+        fallback_text = boost_phrase_matching(fallback_text, query)
         fallback_fused = fuse_results(fallback_text, fallback_image, query_type, top_k=retrieve_k)
 
         active_patient = (metadata_filter or {}).get("patient_name", "").lower()

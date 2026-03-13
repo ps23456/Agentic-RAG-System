@@ -443,6 +443,83 @@ def _needs_ocr(text: str, min_chars: int = 50) -> bool:
     return len(cleaned) < min_chars
 
 
+def extract_text_from_pdf_page(path: str, page_num: int) -> str:
+    """
+    Extract text from a single PDF page. Uses PyMuPDF first (fast); if empty or very short,
+    uses Mistral OCR (when configured) or Tesseract for scanned pages. Used at display time
+    to show query-relevant context (e.g. "primary diagnosis").
+    """
+    try:
+        doc = fitz.open(path)
+        page = doc.load_page(page_num - 1)
+        text = page.get_text() or ""
+        doc.close()
+        if text.strip() and len(text.strip()) >= 30:
+            return text.strip()
+        # Scanned page: prefer Mistral OCR when configured (matches index quality)
+        if _MISTRAL_OCR_KEY and not _is_mistral_disabled():
+            import tempfile
+            try:
+                doc = fitz.open(path)
+                page = doc.load_page(page_num - 1)
+                pix = page.get_pixmap(dpi=150, alpha=False)
+                buf = pix.tobytes("png")
+                doc.close()
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp.write(buf)
+                    tmp_path = tmp.name
+                try:
+                    pages = _mistral_ocr_image(tmp_path)
+                    if pages:
+                        return pages[0][1] or ""
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.debug("Mistral OCR for single page failed: %s", e)
+        return _ocr_pdf_page(path, page_num)
+    except Exception as e:
+        logger.warning("extract_text_from_pdf_page failed for %s p.%s: %s", path, page_num, e)
+    return ""
+
+
+def find_pdf_page_containing_phrases(path: str, phrases: list[str], start_page: int = 1, max_pages: int = 6) -> tuple[int, str]:
+    """
+    Find the first page in a PDF that contains any of the given phrases.
+    Tries start_page first, then nearby pages (start-1..1, start+1..end). Limited to max_pages to avoid cost.
+    Returns (page_num, text) or (start_page, text) if no phrase found.
+    """
+    if not phrases:
+        text = extract_text_from_pdf_page(path, start_page)
+        return start_page, text
+    try:
+        doc = fitz.open(path)
+        total = len(doc)
+        doc.close()
+    except Exception:
+        return start_page, extract_text_from_pdf_page(path, start_page)
+    # Order: start_page, then pages before (start-1..1), then after (start+1..total). Cap at max_pages.
+    to_try = [start_page]
+    for p in range(start_page - 1, 0, -1):
+        to_try.append(p)
+        if len(to_try) >= max_pages:
+            break
+    for p in range(start_page + 1, total + 1):
+        if len(to_try) >= max_pages:
+            break
+        to_try.append(p)
+    for p in to_try:
+        text = extract_text_from_pdf_page(path, p)
+        if not text:
+            continue
+        lower = text.lower()
+        if any(ph and len(ph) >= 3 and ph in lower for ph in phrases):
+            return p, text
+    return start_page, extract_text_from_pdf_page(path, start_page)
+
+
 def _ocr_pdf_page(path: str, page_num: int) -> str:
     """Run OCR on a single PDF page (1-based). Returns extracted text."""
     if not _check_ocr():

@@ -97,7 +97,7 @@ MULTIMODAL_RETRIEVE_CANDIDATES = 50
 CHROMA_IMAGE_COLLECTION_NAME = "image_collection"
 # Query-type fusion weights (text_weight, image_weight). Do NOT mix embedding spaces.
 MULTIMODAL_HYBRID_WEIGHTS = {
-    "text_heavy": (0.8, 0.2),
+    "text_heavy": (0.92, 0.08),   # Strongly favor text (Markdown, PDF text) for queries like "primary diagnosis"
     "image_heavy": (0.3, 0.7),
     "hybrid": (0.5, 0.5),
 }
