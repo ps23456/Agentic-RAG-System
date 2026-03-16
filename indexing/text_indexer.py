@@ -8,6 +8,7 @@ from typing import Optional
 from document_loader import load_and_chunk_folder, Chunk
 from search_index import SearchIndex
 from config import DATA_FOLDER, CHROMA_PERSIST_DIR, CHROMA_COLLECTION_NAME
+from retrieval.agentic_rag import normalize_patient_names_in_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +95,9 @@ def build_text_index(
         vision_provider=vision_provider,
         vision_api_key=vision_api_key
     )
-    
+    # 2b. Normalize patient names at index time (OCR variants -> canonical, no duplicates)
+    normalize_patient_names_in_chunks(chunks)
+
     # 3. Build/Update index
     index = SearchIndex(chunks)
     index.build_bm25()

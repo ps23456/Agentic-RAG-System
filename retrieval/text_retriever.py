@@ -2,6 +2,7 @@
 Text retrieval pipeline: BM25 + dense (SentenceTransformer) -> hybrid fusion -> BGE rerank.
 Uses existing SearchIndex; returns (chunk, score) for normalization in hybrid_fusion.
 """
+import re
 from typing import List, Tuple, Any
 
 from config import (
@@ -74,25 +75,28 @@ class TextRetriever:
         patients: list[str],
         query: str = "",
         top_per_patient: int = 1,
+        patient_name_aliases: dict | None = None,
     ) -> List[Tuple[Any, float]]:
         """
         Retrieve best chunk per patient. Guarantees coverage for list queries.
-        Tries ChromaDB metadata filter first; falls back to text scan when metadata is empty.
-        Returns [(chunk, score), ...] one per patient, ordered by patient list.
+        Uses patient_name_aliases to match OCR variants (Rika Popper -> Rita Pepper).
         """
         if not self.index or not patients:
             return []
         out = []
         found_via_metadata = set()
+        aliases = patient_name_aliases or {}
 
         for p in patients:
             if not p:
                 continue
+            variants = aliases.get(p, [p])
+            mf = {"patient_name": variants if isinstance(variants, list) else [variants]}
             hits = self.index.hybrid_search(
                 query or "Patient Name",
                 top_k=top_per_patient,
                 fusion="rrf",
-                metadata_filter={"patient_name": p},
+                metadata_filter=mf,
             )
             if hits:
                 reranked = self.index.rerank(
@@ -104,13 +108,18 @@ class TextRetriever:
                 out.extend(reranked)
                 found_via_metadata.add(p)
 
-        # Fallback: when ChromaDB has no patient_name metadata, find chunks by text
+        # Fallback: when ChromaDB has no patient_name metadata, find chunks by text or metadata
         missing = [p for p in patients if p and p not in found_via_metadata]
         if missing and self.index and getattr(self.index, "chunks", None):
             for p in missing:
+                variants_lower = {re.sub(r"\s+", " ", v.lower()) for v in (aliases.get(p, [p]) or [p]) if v}
                 for c in self.index.chunks:
-                    text = (getattr(c, "text", "") or "").lower()
-                    if p.lower() in text:
+                    chunk_p = re.sub(r"\s+", " ", (getattr(c, "patient_name", "") or "").lower())
+                    if chunk_p in variants_lower:
+                        out.append((c, 0.9))
+                        break
+                    text_norm = re.sub(r"\s+", " ", (getattr(c, "text", "") or "").lower())
+                    if any(vl in text_norm for vl in variants_lower):
                         out.append((c, 0.9))
                         break
         return out

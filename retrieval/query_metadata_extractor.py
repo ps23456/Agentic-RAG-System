@@ -197,16 +197,19 @@ def merge_metadata_filters(
 def get_index_metadata_catalog(chunks: list) -> dict:
     """
     Build catalog of unique metadata values from index chunks.
-    Used by extract_metadata_from_query for matching.
+    Merges OCR variants (Rika Popper, Rita Peyer -> Rita Pepper).
     """
-    patients = set()
+    from retrieval.agentic_rag import _merge_similar_patient_names, _normalize_name
+
+    patient_counts: dict[str, int] = {}
     claims = set()
     policies = set()
     groups = set()
     for c in chunks or []:
         p = getattr(c, "patient_name", "") or ""
         if p:
-            patients.add(p)
+            pn = _normalize_name(p)
+            patient_counts[pn] = patient_counts.get(pn, 0) + 1
         cl = getattr(c, "claim_number", "") or ""
         if cl:
             claims.add(cl)
@@ -221,8 +224,10 @@ def get_index_metadata_catalog(chunks: list) -> dict:
         d = getattr(c, "doctor_name", "") or ""
         if d:
             doctors.add(d)
+    known_patients, patient_name_aliases = _merge_similar_patient_names(patient_counts)
     return {
-        "known_patients": sorted(patients),
+        "known_patients": known_patients,
+        "patient_name_aliases": patient_name_aliases,
         "known_claims": sorted(claims),
         "known_policies": sorted(policies),
         "known_groups": sorted(groups),

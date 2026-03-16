@@ -6,6 +6,7 @@ Retrieval-only, explainable results.
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 # Ensure project root is on path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -84,6 +85,7 @@ from document_loader import (
     get_mistral_ocr_key,
     extract_text_from_pdf_page,
     find_pdf_page_containing_phrases,
+    extract_chunk_metadata,
 )
 from search_index import SearchIndex
 from llm_insight import (
@@ -135,13 +137,49 @@ def _extract_query_phrases(query: str) -> list[str]:
     return phrases
 
 
-def snippet(text: str, query: str | None = None, max_len: int = 400) -> str:
+def _resolve_llm_for_tree(llm_provider: str, llm_api_key: str) -> tuple[str, str]:
+    """Resolve which API key and provider to use for tree indexing/search.
+    Uses whichever provider the user selected in the sidebar."""
+    provider_lower = (llm_provider or "").lower()
+    if "openai" in provider_lower or "chatgpt" in provider_lower:
+        key = llm_api_key or os.environ.get("OPENAI_API_KEY", "")
+        return key.strip(), "openai"
+    elif "gemini" in provider_lower:
+        key = llm_api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
+        return key.strip(), "gemini"
+    elif "groq" in provider_lower:
+        key = llm_api_key or os.environ.get("GROQ_API_KEY", "")
+        return key.strip(), "groq"
+    elif "mistral" in provider_lower:
+        key = llm_api_key or os.environ.get("MISTRAL_API_KEY", "")
+        return key.strip(), "openai"  # Mistral uses OpenAI-compatible API
+    # Fallback: try all env keys
+    for env_key, prov in [("GROQ_API_KEY", "groq"), ("OPENAI_API_KEY", "openai"), ("GEMINI_API_KEY", "gemini"), ("GOOGLE_API_KEY", "gemini")]:
+        k = os.environ.get(env_key, "")
+        if k:
+            return k.strip(), prov
+    return "", "groq"
+
+
+def _count_tree_nodes(nodes) -> int:
+    """Count total nodes in a tree (including nested children)."""
+    if isinstance(nodes, list):
+        return sum(_count_tree_nodes(n) for n in nodes)
+    elif isinstance(nodes, dict):
+        c = 1
+        if "nodes" in nodes:
+            c += _count_tree_nodes(nodes["nodes"])
+        return c
+    return 0
+
+
+def snippet(text: str, query: str | None = None, max_len: int = 400, prioritize_phrase: str | None = None) -> str:
     """
     Build a short snippet for display.
 
     If a query is provided, try to center the snippet around the first occurrence
     of any meaningful phrase from the query (e.g. "primary diagnosis", "teresa brown").
-    This shows the most relevant part instead of boilerplate at the top.
+    prioritize_phrase: when set (e.g. patient name), center snippet around it so it's visible.
     """
     if not text:
         return ""
@@ -149,15 +187,17 @@ def snippet(text: str, query: str | None = None, max_len: int = 400) -> str:
     if len(flat) <= max_len:
         return flat
 
-    if query:
-        phrases = _extract_query_phrases(query)
+    phrases = _extract_query_phrases(query) if query else []
+    if prioritize_phrase and prioritize_phrase.strip():
+        phrases = [prioritize_phrase.strip()] + [p for p in phrases if p != prioritize_phrase.strip()]
+    if phrases:
         flat_lower = flat.lower()
         best_idx = -1
         best_len = 0
         for p in phrases:
             if len(p) < 3:
                 continue
-            idx = flat_lower.find(p)
+            idx = flat_lower.find(p.lower() if isinstance(p, str) else p)
             if idx != -1 and len(p) > best_len:
                 best_idx = idx
                 best_len = len(p)
@@ -347,6 +387,14 @@ def main():
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("Indexing Settings")
+    indexing_mode = st.sidebar.radio(
+        "For PDFs:",
+        ["Chunk + embedding", "Tree structure (PageIndex)", "Both"],
+        index=0,
+        key="indexing_mode",
+        help="Chunk: BM25 + ChromaDB (default). Tree: vectorless, LLM reasons over section structure. Both: build both.",
+    )
+    indexing_mode_key = {"Chunk + embedding": "chunk", "Tree structure (PageIndex)": "tree", "Both": "both"}.get(indexing_mode, "chunk")
     enable_vision_captioning = st.sidebar.checkbox(
         "Vision LLM Captioning",
         value=False,
@@ -362,6 +410,10 @@ def main():
         st.session_state.multimodal_count = 0
     if "multimodal_hybrid_image_count" not in st.session_state:
         st.session_state.multimodal_hybrid_image_count = 0
+    if "page_trees" not in st.session_state:
+        st.session_state.page_trees = []
+    if "page_tree_count" not in st.session_state:
+        st.session_state.page_tree_count = 0
 
     if rag_mode == "Hybrid RAG":
         if st.session_state.search_index is None:
@@ -410,8 +462,19 @@ def main():
                     st.session_state.chunk_count = len(chunks)
                     st.sidebar.success(f"Rebuilt index: {st.session_state.chunk_count} chunks.")
     elif rag_mode == "Multimodal Hybrid RAG":
+        # Use different key than widget; radio owns st.session_state.indexing_mode
+        st.session_state.mh_indexing_mode = indexing_mode_key
+        # Load trees when tree or both
+        if indexing_mode_key in ("tree", "both"):
+            from indexing.page_tree import load_all_trees
+            st.session_state.page_trees = load_all_trees()
+            st.session_state.page_tree_count = len(st.session_state.page_trees)
+        else:
+            st.session_state.page_trees = []
+            st.session_state.page_tree_count = 0
+
         # Text index (same as Hybrid); image index (separate collection)
-        if st.session_state.search_index is None:
+        if st.session_state.search_index is None and indexing_mode_key != "tree":
             with st.spinner("Loading existing text index from ChromaDB..."):
                 existing = load_existing_index()
                 if existing:
@@ -420,21 +483,34 @@ def main():
                     st.sidebar.success(f"Loaded {st.session_state.chunk_count} chunks from existing index.")
                 else:
                     st.sidebar.info("No existing index found. Click 'Re-index' to build.")
+        elif indexing_mode_key == "tree":
+            st.sidebar.info("Tree mode: using section structure (no chunks). Click 'Re-index' to build trees.")
 
         if st.sidebar.button("Re-index documents (full rebuild)", type="primary", key="mh_index_text"):
-            with st.spinner("Building text index (BM25 + Chroma)..."):
+            with st.spinner("Building index..."):
                 try:
-                    index = build_text_index(
-                        data_folder,
-                        enable_vision=enable_vision_captioning,
-                        vision_provider=llm_provider,
-                        vision_api_key=llm_api_key
-                    )
-                    st.session_state.search_index = index
-                    st.session_state.chunk_count = len(index.chunks)
-                    st.sidebar.success(f"Text index rebuilt: {st.session_state.chunk_count} chunks.")
+                    if indexing_mode_key in ("tree", "both"):
+                        from indexing.page_tree import build_trees_for_folder
+                        llm_key, _provider = _resolve_llm_for_tree(llm_provider, llm_api_key)
+                        trees, n_trees = build_trees_for_folder(data_folder, indexing_mode_key, llm_key, _provider)
+                        st.session_state.page_trees = trees
+                        st.session_state.page_tree_count = n_trees
+                        st.sidebar.success(f"Tree index: {n_trees} PDF(s) with section structure.")
+                    if indexing_mode_key in ("chunk", "both"):
+                        index = build_text_index(
+                            data_folder,
+                            enable_vision=enable_vision_captioning,
+                            vision_provider=llm_provider,
+                            vision_api_key=llm_api_key
+                        )
+                        st.session_state.search_index = index
+                        st.session_state.chunk_count = len(index.chunks)
+                        st.sidebar.success(f"Text index rebuilt: {st.session_state.chunk_count} chunks.")
+                    elif indexing_mode_key == "tree":
+                        st.session_state.search_index = None
+                        st.session_state.chunk_count = 0
                 except Exception as e:
-                    st.sidebar.error(f"Text index failed: {e}")
+                    st.sidebar.error(f"Index failed: {e}")
         if st.sidebar.button("Index / Re-index (Image)", type="secondary", key="mh_index_image"):
             with st.spinner("Building image index (CLIP)..."):
                 try:
@@ -444,7 +520,16 @@ def main():
                 except Exception as e:
                     st.sidebar.error(f"Image index failed: {e}")
         st.session_state.multimodal_hybrid_image_count = get_image_index_count()
-        st.sidebar.caption(f"Text chunks: **{st.session_state.chunk_count}** · Image collection: **{st.session_state.multimodal_hybrid_image_count}**")
+        cap_parts = []
+        if indexing_mode_key != "tree":
+            cap_parts.append(f"Text chunks: **{st.session_state.chunk_count}**")
+        if indexing_mode_key in ("tree", "both"):
+            tree_node_count = sum(
+                _count_tree_nodes(t.get("nodes", [])) for t in st.session_state.page_trees
+            ) if st.session_state.page_trees else 0
+            cap_parts.append(f"Tree index: **{st.session_state.page_tree_count}** PDF(s) · **{tree_node_count}** nodes")
+        cap_parts.append(f"Image collection: **{st.session_state.multimodal_hybrid_image_count}**")
+        st.sidebar.caption(" · ".join(cap_parts))
     elif rag_mode == "Multimodal RAG":
         # Multimodal RAG: separate index only
         if st.sidebar.button("Index / Re-index (Multimodal)", type="primary"):
@@ -483,12 +568,9 @@ def main():
         st.sidebar.markdown("---")
         st.sidebar.subheader("Metadata filters")
         st.sidebar.caption("Filter results by patient or document type (ChromaDB + BM25).")
-        unique_patients = sorted(
-            set(
-                getattr(c, "patient_name", "") or ""
-                for c in index.chunks
-                if getattr(c, "patient_name", "")
-            )
+        catalog_sidebar = get_index_metadata_catalog(index.chunks)
+        unique_patients = catalog_sidebar.get("known_patients", []) or sorted(
+            set(getattr(c, "patient_name", "") or "" for c in index.chunks if getattr(c, "patient_name", ""))
         )
         filter_patient = st.sidebar.selectbox(
             "Patient",
@@ -510,9 +592,9 @@ def main():
         )
         user_metadata_filter = {}
         if filter_patient and filter_patient != "All":
-            user_metadata_filter["patient_name"] = filter_patient
+            aliases = catalog_sidebar.get("patient_name_aliases", {})
+            user_metadata_filter["patient_name"] = aliases.get(filter_patient, [filter_patient])
         # Show metadata catalog (patients, claims) - useful for any query
-        catalog_sidebar = get_index_metadata_catalog(index.chunks)
         if catalog_sidebar.get("known_patients"):
             st.sidebar.caption("Patients in index: " + ", ".join(catalog_sidebar["known_patients"]))
         if catalog_sidebar.get("known_claims"):
@@ -594,7 +676,10 @@ def main():
         with st.spinner("Searching..."):
             if is_list_patients and text_retriever_hybrid:
                 # One chunk per patient - guaranteed coverage
-                one_per = text_retriever_hybrid.retrieve_one_per_patient(catalog["known_patients"], query="Patient Name")
+                one_per = text_retriever_hybrid.retrieve_one_per_patient(
+                    catalog["known_patients"], query="Patient Name",
+                    patient_name_aliases=catalog.get("patient_name_aliases"),
+                )
                 bm25_hits = vector_hits = hybrid_hits = one_per
             elif use_reranker:
                 bm25_hits = index.bm25_search(
@@ -767,19 +852,16 @@ def main():
 
     elif rag_mode == "Multimodal Hybrid RAG":
         # Separate text + image collections; query classification; normalized score fusion
-        if st.session_state.search_index is None:
-            st.info("Click **Index / Re-index documents** in the sidebar to build the text index, then search. Optionally click **Index / Re-index (Image)** for image results.")
+        indexing_mode_mh = getattr(st.session_state, "mh_indexing_mode", "chunk")
+        has_chunks = st.session_state.search_index is not None and (st.session_state.search_index.chunks if st.session_state.search_index else False)
+        has_trees = indexing_mode_mh in ("tree", "both") and st.session_state.page_trees
+        if not has_chunks and not has_trees:
+            st.info("Click **Index / Re-index documents** in the sidebar to build the index. For Tree mode: select 'Tree structure' then re-index. Optionally click **Index / Re-index (Image)** for image results.")
             return
         index = st.session_state.search_index
         # Metadata filter for Multimodal Hybrid (in sidebar)
-        catalog_mh_sidebar = get_robust_catalog(index.chunks) if index.chunks else {}
-        unique_patients_mh = catalog_mh_sidebar.get("known_patients", []) or sorted(
-            set(
-                getattr(c, "patient_name", "") or ""
-                for c in index.chunks
-                if getattr(c, "patient_name", "")
-            )
-        )
+        catalog_mh_sidebar = get_robust_catalog(index.chunks) if index and index.chunks else {}
+        unique_patients_mh = catalog_mh_sidebar.get("known_patients", [])
         if catalog_mh_sidebar.get("known_patients"):
             st.sidebar.caption("Patients in index: " + ", ".join(catalog_mh_sidebar["known_patients"]))
         st.sidebar.caption("Metadata filter (Multimodal Hybrid):")
@@ -809,7 +891,8 @@ def main():
         )
         user_metadata_filter_mh = {}
         if filter_patient_mh and filter_patient_mh != "All":
-            user_metadata_filter_mh["patient_name"] = filter_patient_mh
+            aliases_mh = catalog_mh_sidebar.get("patient_name_aliases", {})
+            user_metadata_filter_mh["patient_name"] = aliases_mh.get(filter_patient_mh, [filter_patient_mh])
         query_mh = st.text_input(
             "Query",
             placeholder='e.g. "insurance claim" or "diagram with boxes and arrows"',
@@ -819,8 +902,8 @@ def main():
             st.caption("Enter a query. Use image-related words (diagram, chart, flow, …) for image-heavy weighting.")
             return
 
-        catalog_mh = get_index_metadata_catalog(index.chunks) if index.chunks else {}
-        robust_catalog = get_robust_catalog(index.chunks) if index.chunks else {}
+        catalog_mh = get_index_metadata_catalog(index.chunks) if index and index.chunks else {}
+        robust_catalog = get_robust_catalog(index.chunks) if index and index.chunks else {}
         metadata_filter_mh = user_metadata_filter_mh or None
 
         # Flow diagnostic: show why list-patients or normal path was chosen
@@ -831,7 +914,50 @@ def main():
                 st.write("**List-patients intent:**", detect_list_patients_intent(query_mh))
                 st.write("**known_patients:**", robust_catalog.get("known_patients") or catalog_mh.get("known_patients"))
 
-        if use_agentic_rag:
+        # Tree search: run in parallel with chunk retrieval when "both" for speed
+        # Cache results in session_state so source-button clicks don't re-trigger search
+        tree_fused = []
+        tree_future = None
+        _tree_exec = None
+        tree_summary = ""
+        tree_sources = []
+        _tree_cache_key = f"_tree_cache_{hash(query_mh)}"
+        _tree_cached = st.session_state.get(_tree_cache_key)
+        if indexing_mode_mh in ("tree", "both") and st.session_state.page_trees:
+            if _tree_cached and _tree_cached.get("query") == query_mh:
+                tree_fused = _tree_cached.get("fused", [])
+                tree_summary = _tree_cached.get("summary", "")
+                tree_sources = _tree_cached.get("sources", [])
+            else:
+                from indexing.page_tree import tree_search
+                llm_key_mh, _prov = _resolve_llm_for_tree(llm_provider, llm_api_key)
+                if indexing_mode_mh == "both":
+                    _tree_exec = ThreadPoolExecutor(max_workers=2)
+                    tree_future = _tree_exec.submit(tree_search, query_mh, st.session_state.page_trees, llm_key_mh, _prov, data_folder)
+                else:
+                    tree_result = tree_search(query_mh, st.session_state.page_trees, llm_key_mh, _prov, data_folder)
+                    tree_fused = [{"type": "text", "content": tc, "final_score": sc} for tc, sc in tree_result.get("chunks", [])]
+                    tree_summary = tree_result.get("summary", "")
+                    tree_sources = tree_result.get("sources", [])
+                    st.session_state[_tree_cache_key] = {
+                        "query": query_mh, "fused": tree_fused,
+                        "summary": tree_summary, "sources": tree_sources,
+                    }
+
+        if indexing_mode_mh == "tree":
+            fused = tree_fused
+            n_tree_nodes = sum(
+                _count_tree_nodes(t.get("nodes", [])) for t in st.session_state.page_trees
+            ) if st.session_state.page_trees else 0
+            understanding_mh = {
+                "intent": "tree_search",
+                "query_type": "text_heavy",
+                "reasoning": f"LLM navigated {n_tree_nodes} tree nodes across {len(st.session_state.page_trees)} document(s) to find relevant sections.",
+            }
+            direct_answer = None
+            text_results = [(r["content"], r["final_score"]) for r in fused]
+            image_results = []
+        elif use_agentic_rag and index:
             # Agentic RAG: understand query → route to correct retrieval
             # When agentic is ON, always use LLM if any key is available
             with st.spinner("Agentic RAG: understanding query & retrieving..."):
@@ -907,7 +1033,10 @@ def main():
                 query_type = classify_query(query_mh)
                 if is_list_patients and (robust_catalog.get("known_patients") or catalog_mh.get("known_patients")):
                     patients = robust_catalog.get("known_patients") or catalog_mh.get("known_patients")
-                    text_results = text_retriever.retrieve_one_per_patient(patients, query="Patient Name")
+                    text_results = text_retriever.retrieve_one_per_patient(
+                        patients, query="Patient Name",
+                        patient_name_aliases=(robust_catalog or catalog_mh).get("patient_name_aliases"),
+                    )
                     image_results = []
                     fused = [{"type": "text", "content": c, "final_score": s} for c, s in text_results]
                 else:
@@ -924,8 +1053,32 @@ def main():
                         fused = diversify_fused_results(fused, entity_key="patient_name", top_k=MULTIMODAL_HYBRID_TOP_K, max_per_entity=METADATA_DIVERSITY_MAX_PER_ENTITY)
             direct_answer = understanding_mh.get("direct_answer") if understanding_mh else None
 
-        # For debug display: derive text_results/image_results from fused when agentic
-        if use_agentic_rag:
+        # Both mode: get tree results (from parallel run) and prepend to fused
+        if indexing_mode_mh == "both" and tree_future is not None:
+            try:
+                tree_result = tree_future.result(timeout=90)
+                tree_fused = [{"type": "text", "content": tc, "final_score": sc} for tc, sc in tree_result.get("chunks", [])]
+                tree_summary = tree_result.get("summary", "")
+                tree_sources = tree_result.get("sources", [])
+                st.session_state[_tree_cache_key] = {
+                    "query": query_mh, "fused": tree_fused,
+                    "summary": tree_summary, "sources": tree_sources,
+                }
+            except Exception:
+                tree_fused = []
+            if _tree_exec:
+                _tree_exec.shutdown(wait=False)
+        if indexing_mode_mh == "both" and tree_fused and fused:
+            seen_ids = {getattr(r["content"], "chunk_id", None) for r in fused if r["type"] == "text"}
+            for tr in tree_fused:
+                cid = getattr(tr["content"], "chunk_id", None)
+                if cid and cid not in seen_ids:
+                    fused.insert(0, tr)
+                    seen_ids.add(cid)
+            fused = fused[:15]
+
+        # For debug display: derive text_results/image_results from fused
+        if indexing_mode_mh == "tree" or use_agentic_rag:
             text_results = [(r["content"], r["final_score"]) for r in fused if r["type"] == "text"]
             image_results = [(r["content"], r["final_score"]) for r in fused if r["type"] == "image"]
 
@@ -935,22 +1088,133 @@ def main():
             else classify_query(query_mh)
         )
         weights = MULTIMODAL_HYBRID_WEIGHTS.get(query_type, (0.5, 0.5))
-        st.subheader("Multimodal Hybrid Results" + (" (Agentic)" if use_agentic_rag else ""))
-        st.caption("Fused ranking: text (BM25 + dense + rerank) + image (CLIP). Query type: **%s** · Weights: text=%.2f, image=%.2f" % (query_type, weights[0], weights[1]))
-        if use_agentic_rag and understanding_mh:
-            with st.expander("Agent understanding", expanded=False):
-                if understanding_mh.get("reasoning"):
-                    st.write("**Reasoning:**", understanding_mh["reasoning"])
-                st.write("**Intent:**", understanding_mh.get("intent", "—"))
-                if understanding_mh.get("main_intent_keywords"):
-                    st.write("**Main intent:**", ", ".join(understanding_mh["main_intent_keywords"]))
-                st.write("**Search queries:**", understanding_mh.get("search_queries", []))
-        answer_to_show = direct_answer
-        if answer_to_show:
-            st.success("**" + answer_to_show + "**")
-        if not fused:
+        # --- PageIndex-style side-by-side: Summary (left) + PDF viewer (right) ---
+        if indexing_mode_mh in ("tree", "both") and tree_summary:
+            # Deduplicate sources
+            seen_sources = set()
+            unique_sources = []
+            for src in tree_sources:
+                key = (src.get("file_name", ""), src.get("page", ""))
+                if key not in seen_sources:
+                    seen_sources.add(key)
+                    unique_sources.append(src)
+
+            # Auto-select the first source if none selected yet
+            if unique_sources and "_tree_view_src" not in st.session_state:
+                st.session_state["_tree_view_src"] = {
+                    "file_name": unique_sources[0].get("file_name", ""),
+                    "page": unique_sources[0].get("page", 1),
+                }
+
+            view_src = st.session_state.get("_tree_view_src")
+
+            # Side-by-side layout: summary left (55%), PDF viewer right (45%)
+            col_summary, col_viewer = st.columns([55, 45], gap="medium")
+
+            with col_summary:
+                st.subheader("PageIndex Results")
+                st.markdown(tree_summary)
+
+                # Source buttons
+                if unique_sources:
+                    st.markdown("---")
+                    src_cols = st.columns(min(len(unique_sources), 3))
+                    for idx, src in enumerate(unique_sources[:3]):
+                        fname = src.get("file_name", "")
+                        pg = src.get("page", "")
+                        short_name = fname[:18] + "..." if len(fname) > 21 else fname
+                        is_active = view_src and view_src.get("file_name") == fname and str(view_src.get("page")) == str(pg)
+                        btn_label = f"{'📖' if is_active else '📄'} {short_name} p.{pg}"
+                        btn_key = f"tree_src_{idx}_{fname}_{pg}"
+                        with src_cols[idx]:
+                            if st.button(btn_label, key=btn_key, use_container_width=True, type="primary" if is_active else "secondary"):
+                                st.session_state["_tree_view_src"] = {"file_name": fname, "page": pg}
+                                st.rerun()
+
+                with st.expander("Tree search details", expanded=False):
+                    n_tree_nodes = sum(
+                        _count_tree_nodes(t.get("nodes", [])) for t in st.session_state.page_trees
+                    ) if st.session_state.page_trees else 0
+                    st.caption(f"Navigated {n_tree_nodes} tree nodes across {len(st.session_state.page_trees)} doc(s) · Found {len(fused)} sections")
+                    for i, row in enumerate(fused[:5], 1):
+                        if row["type"] == "text":
+                            chunk = row["content"]
+                            pg = getattr(chunk, "page_number", 0) or "?"
+                            title = getattr(chunk, "_section_title", "") or ""
+                            st.caption(f"{i}. {getattr(chunk, 'file_name', '')} (p.{pg})" + (f" — {title}" if title else ""))
+
+            with col_viewer:
+                if view_src:
+                    _vs_fname = view_src.get("file_name", "")
+                    _vs_page = int(view_src.get("page", 1) or 1)
+                    _vs_path = None
+                    for root, _dirs, files in os.walk(data_folder):
+                        if _vs_fname in files:
+                            _vs_path = os.path.join(root, _vs_fname)
+                            break
+                    if _vs_path and os.path.isfile(_vs_path) and _vs_path.lower().endswith(".pdf"):
+                        try:
+                            import fitz as _fitz_tree
+                            import io as _io_tree
+                            from PIL import Image as _PILImage_tree
+                            doc = _fitz_tree.open(_vs_path)
+                            total_pages = len(doc)
+
+                            # Page navigation
+                            nav_cols = st.columns([1, 3, 1])
+                            with nav_cols[0]:
+                                if _vs_page > 1:
+                                    if st.button("◀ Prev", key="tree_pg_prev", use_container_width=True):
+                                        st.session_state["_tree_view_src"] = {"file_name": _vs_fname, "page": _vs_page - 1}
+                                        st.rerun()
+                            with nav_cols[1]:
+                                st.markdown(f"<div style='text-align:center'><b>{_vs_fname}</b><br>Page {_vs_page} / {total_pages}</div>", unsafe_allow_html=True)
+                            with nav_cols[2]:
+                                if _vs_page < total_pages:
+                                    if st.button("Next ▶", key="tree_pg_next", use_container_width=True):
+                                        st.session_state["_tree_view_src"] = {"file_name": _vs_fname, "page": _vs_page + 1}
+                                        st.rerun()
+
+                            pg_idx = max(0, _vs_page - 1)
+                            if pg_idx < total_pages:
+                                page_obj = doc.load_page(pg_idx)
+                                pix = page_obj.get_pixmap(dpi=150, alpha=False)
+                                buf = pix.tobytes("png")
+                                img = _PILImage_tree.open(_io_tree.BytesIO(buf)).convert("RGB")
+                                st.image(img, use_container_width=True)
+                            doc.close()
+                        except Exception as _e_tree:
+                            st.warning(f"Could not render page: {_e_tree}")
+                    else:
+                        st.info(f"PDF not found: {_vs_fname}")
+                else:
+                    st.caption("Click a source to view the PDF page here.")
+
+            if indexing_mode_mh == "both":
+                st.markdown("---")
+
+        # --- Standard results display (skip in tree-only mode when summary is present) ---
+        _tree_only_with_summary = indexing_mode_mh == "tree" and bool(tree_summary)
+        if not _tree_only_with_summary:
+            st.subheader("Multimodal Hybrid Results" + (" (Agentic)" if use_agentic_rag else "") + (" (Tree)" if indexing_mode_mh in ("tree", "both") else ""))
+            st.caption("Fused ranking: text (BM25 + dense + rerank) + image (CLIP). Query type: **%s** · Weights: text=%.2f, image=%.2f" % (query_type, weights[0], weights[1]))
+            if (use_agentic_rag or indexing_mode_mh == "tree") and understanding_mh:
+                with st.expander("Agent understanding", expanded=False):
+                    if understanding_mh.get("reasoning"):
+                        st.write("**Reasoning:**", understanding_mh["reasoning"])
+                    st.write("**Intent:**", understanding_mh.get("intent", "—"))
+                    if understanding_mh.get("main_intent_keywords"):
+                        st.write("**Main intent:**", ", ".join(understanding_mh["main_intent_keywords"]))
+                    if understanding_mh.get("search_queries"):
+                        st.write("**Search queries:**", understanding_mh["search_queries"])
+                    if indexing_mode_mh == "tree":
+                        st.caption("Tree mode: LLM reasoned over sections to find relevant nodes.")
+            answer_to_show = direct_answer
+            if answer_to_show:
+                st.success("**" + answer_to_show + "**")
+        if not fused and not tree_summary:
             st.info("No results. Index documents and optionally the image collection (sidebar).")
-        else:
+        if fused and not _tree_only_with_summary:
             debug = st.checkbox("Show debug (query type, top text/image, fusion)", value=False, key="mh_debug")
             if debug:
                 with st.expander("Debug: retrieval and fusion"):
@@ -975,7 +1239,14 @@ def main():
                     query_norm = re.sub(r"\s+", " ", (query_mh or "").strip().lower())
                     is_exact = i == 1 and len(query_norm) >= 10 and query_norm in chunk_text
                     exact_badge = " · **Exact match**" if is_exact else ""
-                    st.markdown("**%d. %s**" % (i, getattr(chunk, "file_name", "")) + (f" (p.{getattr(chunk, 'page_number', 0)})" if getattr(chunk, "page_number", 0) else "") + exact_badge)
+                    patient_label = ""
+                    pn = getattr(chunk, "patient_name", "") or ""
+                    if not pn and (chunk.text or ""):
+                        from document_loader import extract_chunk_metadata as _ecm
+                        pn = _ecm(chunk.text).get("patient_name", "") or ""
+                    if pn:
+                        patient_label = " · **Patient: %s**" % pn
+                    st.markdown("**%d. %s**" % (i, getattr(chunk, "file_name", "")) + (f" (p.{getattr(chunk, 'page_number', 0)})" if getattr(chunk, "page_number", 0) else "") + patient_label + exact_badge)
                     # If this text comes from an image file (e.g. JPG), show the image as well as the OCR text
                     fname = getattr(chunk, "file_name", "") or ""
                     if fname and os.path.splitext(fname)[1].lower() in (".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"):
@@ -1001,10 +1272,12 @@ def main():
                                         display_text = page_text
                                 break
                     st.caption("Fused score: %.4f · Text" % row["final_score"] + (f" · Context from p.{found_page}" if found_page != page_num else ""))
-                    st.text(snippet(display_text, query=query_mh))
+                    st.text(snippet(display_text, query=query_mh, prioritize_phrase=pn or None))
                 else:
                     item = row["content"]
-                    st.markdown("**%d. %s**" % (i, item.get("file_name", "")) + (f" (p.{item.get('page', '')})" if item.get("page") else ""))
+                    img_patient = item.get("patient_name", "") or ""
+                    img_patient_label = " · **Patient: %s**" % img_patient if img_patient else ""
+                    st.markdown("**%d. %s**" % (i, item.get("file_name", "")) + (f" (p.{item.get('page', '')})" if item.get("page") else "") + img_patient_label)
                     st.caption("Fused score: %.4f · Image" % row["final_score"])
                     path = item.get("path", "")
                     if item.get("is_pdf_page") and path:
@@ -1452,7 +1725,8 @@ def main():
                     # Fallback: indexed images (ImageRetriever) from ChromaDB
                     st.subheader(f"Imaging History for {patient_choice} ({report_type_filter}) {label_suffix}")
                     ir = ImageRetriever()
-                    mf = {"patient_name": patient_choice}
+                    aliases_ma = catalog.get("patient_name_aliases", {})
+                    mf = {"patient_name": aliases_ma.get(patient_choice, [patient_choice])}
                     if report_type_filter != "All":
                         # "Other" includes unclassified docs (report_type="") from uploads/
                         mf["report_type"] = [report_type_filter, ""] if report_type_filter == "Other" else report_type_filter
@@ -1539,9 +1813,11 @@ def main():
                 # Fetch historical text context for temporal comparison
                 history_context = ""
                 if patient_choice != "None":
-                    # Get text chunks for this patient
+                    # Get text chunks for this patient (include OCR variants)
                     tr = TextRetriever(st.session_state.search_index)
-                    text_hits = tr.retrieve(clinical_query, top_k=20, metadata_filter={"patient_name": patient_choice})
+                    aliases_ma = catalog.get("patient_name_aliases", {})
+                    mf_ma = {"patient_name": aliases_ma.get(patient_choice, [patient_choice])}
+                    text_hits = tr.retrieve(clinical_query, top_k=20, metadata_filter=mf_ma)
                     history_context = build_context([h[0] for h in text_hits])
                 
                 provider_key = (

@@ -11,9 +11,13 @@ The LLM decides everything; rule-based is fallback only when no API key.
 import json
 import os
 import re
+from difflib import SequenceMatcher
 from typing import Any, List, Tuple, Optional
 
 from document_loader import extract_chunk_metadata
+
+# OCR often misreads names: "Rita Pepper" -> "Rika Popper", "Rita Peyer". Merge similar names.
+_PATIENT_NAME_SIMILARITY_THRESHOLD = 0.82
 
 # ──────────────────────────────────────────────────────────────
 # Catalog & metadata helpers
@@ -50,9 +54,152 @@ def _is_valid_metadata(key: str, value: str) -> bool:
     return True
 
 
+def _name_similarity(a: str, b: str) -> float:
+    """Jaro-Winkler-like: high for OCR variants (Rika Popper vs Rita Pepper)."""
+    if not a or not b:
+        return 0.0
+    a, b = a.strip().lower(), b.strip().lower()
+    if a == b:
+        return 1.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _merge_similar_patient_names(
+    patient_counts: dict[str, int],
+) -> tuple[list[str], dict[str, list[str]]]:
+    """
+    Merge OCR variants (Rika Popper, Rita Peyer -> Rita Pepper).
+    Returns (canonical_list, alias_map) where alias_map[canonical] = [all variants including canonical].
+    """
+    names = list(patient_counts.keys())
+    if not names:
+        return [], {}
+
+    # Union-find: group similar names
+    parent: dict[str, str] = {n: n for n in names}
+
+    def find(x: str) -> str:
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
+
+    def union(a: str, b: str) -> None:
+        pa, pb = find(a), find(b)
+        if pa == pb:
+            return
+        # Merge into the one with higher count (likely correct spelling)
+        ca, cb = patient_counts.get(pa, 0), patient_counts.get(pb, 0)
+        if ca >= cb:
+            parent[pb] = pa
+        else:
+            parent[pa] = pb
+
+    for i, a in enumerate(names):
+        for b in names[i + 1 :]:
+            if _name_similarity(a, b) >= _PATIENT_NAME_SIMILARITY_THRESHOLD:
+                union(a, b)
+
+    # Build canonical (rep with max count per group) and alias map
+    groups: dict[str, list[str]] = {}
+    for n in names:
+        rep = find(n)
+        if rep not in groups:
+            groups[rep] = []
+        groups[rep].append(n)
+
+    canonical_list = []
+    alias_map: dict[str, list[str]] = {}
+    for rep, members in groups.items():
+        # Canonical = member with highest chunk count
+        best = max(members, key=lambda m: patient_counts.get(m, 0))
+        canonical_list.append(best)
+        alias_map[best] = sorted(set(members))
+
+    return sorted(canonical_list), alias_map
+
+
+def _build_variant_to_canonical(alias_map: dict[str, list[str]]) -> dict[str, str]:
+    """Map each variant (including canonical) to its canonical form."""
+    out: dict[str, str] = {}
+    for canonical, variants in alias_map.items():
+        for v in variants:
+            if v:
+                out[v] = canonical
+    return out
+
+
+def normalize_patient_names_in_chunks(chunks: list) -> None:
+    """
+    At index time: rewrite chunk.patient_name to canonical form.
+    Prevents OCR variants (Rika Popper, Rita Peyer) from being stored as separate patients.
+    Modifies chunks in place.
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+    if not chunks:
+        return
+    patient_counts: dict[str, int] = {}
+    for c in chunks or []:
+        p = getattr(c, "patient_name", "") or ""
+        if not p:
+            text = getattr(c, "text", "") or ""
+            if text:
+                p = extract_chunk_metadata(text).get("patient_name", "")
+        if p:
+            pn = _normalize_name(p)
+            patient_counts[pn] = patient_counts.get(pn, 0) + 1
+    _, alias_map = _merge_similar_patient_names(patient_counts)
+    variant_to_canonical = _build_variant_to_canonical(alias_map)
+    n_rewritten = 0
+    for c in chunks:
+        p = getattr(c, "patient_name", "") or ""
+        if not p:
+            text = getattr(c, "text", "") or ""
+            if text:
+                p = extract_chunk_metadata(text).get("patient_name", "")
+        if p:
+            pn = _normalize_name(p)
+            canonical = variant_to_canonical.get(pn, pn)
+            if canonical != pn:
+                n_rewritten += 1
+            c.patient_name = canonical
+    if n_rewritten:
+        _log.info("Normalized %d chunk(s) patient_name (OCR variants -> canonical)", n_rewritten)
+
+
+def normalize_patient_names_in_items(
+    items: list[dict],
+    existing_patient_names: list[str] | None = None,
+) -> None:
+    """
+    At index time: rewrite item['patient_name'] to canonical form (for image index).
+    existing_patient_names: from Chroma so we merge new OCR variants with already-indexed names.
+    Modifies items in place.
+    """
+    patient_counts: dict[str, int] = {}
+    for p in existing_patient_names or []:
+        pn = _normalize_name(p or "")
+        if pn:
+            patient_counts[pn] = patient_counts.get(pn, 0) + 10  # weight existing
+    for x in items or []:
+        p = _normalize_name(x.get("patient_name", "") or "")
+        if p:
+            patient_counts[p] = patient_counts.get(p, 0) + 1
+    if not patient_counts:
+        return
+    _, alias_map = _merge_similar_patient_names(patient_counts)
+    variant_to_canonical = _build_variant_to_canonical(alias_map)
+    for x in items or []:
+        p = _normalize_name(x.get("patient_name", "") or "")
+        if p:
+            x["patient_name"] = variant_to_canonical.get(p, p)
+
+
 def get_robust_catalog(chunks: list) -> dict:
-    """Build a clean catalog of entities from chunks (attribute + text fallback)."""
-    patients, claims, policies, groups, doctors = set(), set(), set(), set(), set()
+    """Build a clean catalog of entities from chunks (attribute + text fallback).
+    Merges OCR variants (Rika Popper, Rita Peyer -> Rita Pepper) to avoid duplicates."""
+    patient_counts: dict[str, int] = {}
+    claims, policies, groups, doctors = set(), set(), set(), set()
 
     for c in chunks or []:
         p = getattr(c, "patient_name", "") or ""
@@ -72,7 +219,8 @@ def get_robust_catalog(chunks: list) -> dict:
                 d = d or meta.get("doctor_name", "")
 
         if p:
-            patients.add(_normalize_name(p))
+            pn = _normalize_name(p)
+            patient_counts[pn] = patient_counts.get(pn, 0) + 1
         if cl and _is_valid_metadata("claim_number", cl):
             claims.add(cl)
         if pol and _is_valid_metadata("policy_number", pol):
@@ -82,8 +230,11 @@ def get_robust_catalog(chunks: list) -> dict:
         if d and _is_valid_metadata("doctor_name", d) and len(d.split()) <= 6:
             doctors.add(_normalize_name(d))
 
+    known_patients, patient_name_aliases = _merge_similar_patient_names(patient_counts)
+
     return {
-        "known_patients": sorted(patients),
+        "known_patients": known_patients,
+        "patient_name_aliases": patient_name_aliases,
         "known_claims": sorted(claims),
         "known_policies": sorted(policies),
         "known_groups": sorted(groups),
@@ -353,18 +504,35 @@ def _fallback_plan(query: str, catalog: dict) -> dict:
 # Retrieval execution
 # ──────────────────────────────────────────────────────────────
 
-def _find_best_chunk_per_patient(patient: str, chunks: list, top_n: int = 1) -> list:
-    """Find chunks for a patient by text scan. Prefers header mentions."""
-    p_lower = patient.lower()
+def _find_best_chunk_per_patient(
+    patient: str, chunks: list, top_n: int = 1, variants: list | None = None
+) -> list:
+    """Find chunks for a patient by text or metadata. Prefers header mentions. variants = OCR aliases."""
+    check_names = [patient] + (variants or [])
+    check_lower = {re.sub(r"\s+", " ", n.lower()) for n in check_names if n}
     scored = []
     for c in chunks or []:
-        text = (getattr(c, "text", "") or "")
-        text_lower = text.lower()
-        if p_lower not in text_lower:
+        chunk_patient = re.sub(r"\s+", " ", (getattr(c, "patient_name", "") or "").lower())
+        if chunk_patient and chunk_patient not in check_lower:
             continue
-        pos = text_lower.find(p_lower)
+        text = (getattr(c, "text", "") or "")
+        text_norm = re.sub(r"\s+", " ", text.lower())  # collapse spaces for matching
+        matched_via_tokens = False
+        if not chunk_patient and not any(p in text_norm for p in check_lower):
+            # Also try: both first+last name tokens present (handles "Jude, Alyson", extra spaces)
+            tokens = {w for w in re.findall(r"[a-z]+", text_norm) if len(w) >= 2}
+            patient_tokens = {w for n in check_names if n for w in n.lower().split() if len(w) >= 2}
+            if not (patient_tokens and patient_tokens <= tokens):
+                continue
+            matched_via_tokens = True
+        text_lower = text.lower()
+        text_norm_for_pos = re.sub(r"\s+", " ", text_lower)
+        if matched_via_tokens:
+            pos = min((text_lower.find(t) for t in patient_tokens if t in text_lower), default=0)
+        else:
+            pos = min((text_norm_for_pos.find(p) for p in check_lower if p in text_norm_for_pos), default=len(text_lower))
         position_score = max(0.0, 1.0 - (pos / max(len(text_lower), 1)))
-        has_label = 1.0 if "patient name" in text_lower[:pos + len(p_lower) + 20] else 0.0
+        has_label = 1.0 if "patient name" in text_lower[: pos + 50] else 0.0
         score = position_score + has_label
         scored.append((c, score))
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -416,8 +584,9 @@ def _multi_query_retrieve(
     user says "forex exposure not hedged". Dynamic, no hardcoding.
     boost_ocr: when True (text-heavy queries), images with exact query words in OCR rank higher.
     """
+    # Cap queries for speed (2 agent + 1 intent keyword = 3 max)
     queries = _expand_queries_with_intent_keywords(
-        search_queries, main_intent_keywords, max_extra=3
+        search_queries[:2], main_intent_keywords, max_extra=1
     )
     all_text = {}
     all_image = {}
@@ -446,27 +615,28 @@ def _list_entities_retrieve(
     search_queries: list[str],
     text_retriever: Any,
     index: Any,
+    patient_name_aliases: dict | None = None,
 ) -> list[dict]:
-    """Guaranteed one-chunk-per-patient retrieval."""
+    """Guaranteed one-chunk-per-patient retrieval. Uses aliases to match OCR variants."""
     fused = []
     rerank_query = search_queries[0] if search_queries else "Patient Name"
+    aliases = patient_name_aliases or {}
 
     for p in patients:
         found = False
-        for name_variant in {p, p.upper(), _normalize_name(p)}:
-            hits = text_retriever.index.hybrid_search(
-                "Patient Name", top_k=3, fusion="rrf",
-                metadata_filter={"patient_name": name_variant},
-            )
-            if hits:
-                reranked = text_retriever.index.rerank(rerank_query + " " + p, hits, top_k=1)
-                if reranked:
-                    fused.append({"type": "text", "content": reranked[0][0], "final_score": reranked[0][1]})
-                    found = True
-                    break
-
+        variants = aliases.get(p, [p, p.upper(), _normalize_name(p)])
+        mf = {"patient_name": variants if isinstance(variants, list) else [variants]}
+        hits = text_retriever.index.hybrid_search(
+            "Patient Name", top_k=3, fusion="rrf",
+            metadata_filter=mf,
+        )
+        if hits:
+            reranked = text_retriever.index.rerank(rerank_query + " " + p, hits, top_k=1)
+            if reranked:
+                fused.append({"type": "text", "content": reranked[0][0], "final_score": reranked[0][1]})
+                found = True
         if not found:
-            best = _find_best_chunk_per_patient(p, index.chunks, top_n=1)
+            best = _find_best_chunk_per_patient(p, index.chunks, top_n=1, variants=aliases.get(p))
             if best:
                 fused.append({"type": "text", "content": best[0][0], "final_score": best[0][1]})
 
@@ -478,27 +648,28 @@ def _per_patient_attribute_retrieve(
     search_queries: list[str],
     text_retriever: Any,
     index: Any,
+    patient_name_aliases: dict | None = None,
 ) -> list[dict]:
-    """Search for a specific attribute across all patients."""
+    """Search for a specific attribute across all patients. Uses aliases for OCR variants."""
     fused = []
     rerank_query = " ".join(search_queries[:2]) if search_queries else "patient information"
+    aliases = patient_name_aliases or {}
 
     for p in patients:
         hits = []
-        for name_variant in {p, p.upper(), _normalize_name(p)}:
-            for sq in search_queries[:2]:
-                h = text_retriever.index.hybrid_search(
-                    sq, top_k=5, fusion="rrf",
-                    metadata_filter={"patient_name": name_variant},
-                )
-                if h:
-                    hits.extend(h)
-                    break
-            if hits:
+        variants = aliases.get(p, [p, p.upper(), _normalize_name(p)])
+        mf = {"patient_name": variants if isinstance(variants, list) else [variants]}
+        for sq in search_queries[:2]:
+            h = text_retriever.index.hybrid_search(
+                sq, top_k=5, fusion="rrf",
+                metadata_filter=mf,
+            )
+            if h:
+                hits.extend(h)
                 break
 
         if not hits:
-            best = _find_best_chunk_per_patient(p, index.chunks, top_n=3)
+            best = _find_best_chunk_per_patient(p, index.chunks, top_n=3, variants=aliases.get(p))
             hits = [(c, s) for c, s in best]
 
         if hits:
@@ -575,6 +746,12 @@ def run_agentic_rag(
 
     # Extract plan fields (LLM-derived when available; dynamic for any query/patient)
     intent = plan.get("intent", "general_search")
+    # Override: if query clearly asks for list of patients and catalog has them, ensure list_entities
+    q_lower = (query or "").strip().lower()
+    if "patient" in q_lower and any(w in q_lower for w in ["list", "show", "all", "every", "who", "name", "enumerate"]):
+        if catalog_final.get("known_patients"):
+            intent = "list_entities"
+            plan["target_attribute"] = plan.get("target_attribute") or "known_patients"
     search_queries = plan.get("search_queries") or [query]
     main_intent_keywords = plan.get("main_intent_keywords") or []
     scope = plan.get("scope", "unscoped")
@@ -585,10 +762,11 @@ def run_agentic_rag(
     main_phrases = main_intent_keywords if main_intent_keywords else None
     filter_phrases = [patient_filter] if patient_filter else None
 
-    # Build metadata filter
+    # Build metadata filter (expand patient to OCR variants for matching)
     metadata_filter = {}
     if patient_filter:
-        metadata_filter["patient_name"] = patient_filter
+        aliases = (catalog_final or {}).get("patient_name_aliases", {})
+        metadata_filter["patient_name"] = aliases.get(patient_filter, [patient_filter])
     metadata_filter = merge_metadata_filters(
         user_metadata_filter or {},
         metadata_filter,
@@ -611,20 +789,24 @@ def run_agentic_rag(
     retrieve_k = METADATA_DIVERSITY_CANDIDATES if METADATA_DIVERSITY_ENABLED else MULTIMODAL_HYBRID_TOP_K
 
     # Step 3: Execute the plan
+    aliases = catalog_final.get("patient_name_aliases", {})
     if intent == "list_entities" and catalog_final.get("known_patients") and "patient" in (target_attr or "patient"):
         fused = _list_entities_retrieve(
             catalog_final["known_patients"], search_queries, text_retriever, index,
+            patient_name_aliases=aliases,
         )
 
     elif intent == "list_entities" and catalog_final.get("known_doctors") and "doctor" in (target_attr or ""):
         fused = _list_entities_retrieve(
             catalog_final["known_patients"], search_queries, text_retriever, index,
+            patient_name_aliases=aliases,
         )
         understanding["direct_answer"] = "Doctors: " + ", ".join(catalog_final["known_doctors"])
 
     elif scope == "all_patients" and catalog_final.get("known_patients") and intent != "general_search":
         fused = _per_patient_attribute_retrieve(
             catalog_final["known_patients"], search_queries, text_retriever, index,
+            patient_name_aliases=aliases,
         )
 
     else:

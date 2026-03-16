@@ -345,6 +345,18 @@ def build_image_index(data_folder: str | None = None) -> int:
 
     # 2. Collect only new/changed items
     image_items = _collect_image_items(data_folder, existing_mtimes=existing_mtimes)
+    if image_items:
+        from retrieval.agentic_rag import normalize_patient_names_in_items
+        existing_patients = []
+        try:
+            existing = collection.get(include=["metadatas"])
+            for m in (existing.get("metadatas") or []):
+                pn = (m or {}).get("patient_name", "")
+                if pn:
+                    existing_patients.append(pn)
+        except Exception:
+            pass
+        normalize_patient_names_in_items(image_items, existing_patient_names=existing_patients)
     if not image_items:
         logger.info("Image index: no image items found in %s", data_folder)
         return 0

@@ -117,3 +117,13 @@ USE_IMAGE_RERANKER = False
 IMAGE_RERANKER_MODEL = "google/siglip-base-patch16-224"
 # How many CLIP results to pass to the image reranker; then return top MULTIMODAL_HYBRID_IMAGE_TOP_N.
 IMAGE_RERANKER_CANDIDATES = 50
+
+# --- PageIndex-style tree indexing (vectorless, no chunking) ---
+# Where to store tree JSON files (one per PDF)
+PAGE_TREE_CACHE_DIR = os.path.join(DATA_FOLDER, "cache", "trees")
+# Pages to check for Table of Contents (PageIndex: TOC is usually in first 20-50 pages)
+PAGE_TREE_TOC_PAGES = 50
+# Max pages per LLM chunk when chunked processing (no TOC)
+PAGE_TREE_MAX_PAGES_PER_LLM = 20
+# Max pages per leaf node (PageIndex uses 10). Larger sections are split into sub-sections.
+PAGE_TREE_MAX_PAGES_PER_NODE = 10

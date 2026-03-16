@@ -1,0 +1,363 @@
+{
+  "file_name": "APS_TBrown.pdf",
+  "file_path": "/Users/pshah/testing 3/data/uploads/APS_TBrown.pdf",
+  "nodes": [
+    {
+      "title": "ATTENDING PHYSICIAN'S STATEMENT OF DISABILITY",
+      "node_id": "0000",
+      "start_index": 1,
+      "end_index": 1,
+      "summary": "ATTENDING PHYSICIAN'S STATEMENT OF DISABILITY",
+      "nodes": [
+        {
+          "title": "INSURED INFORMATION",
+          "node_id": "0001",
+          "start_index": 1,
+          "end_index": 1,
+          "summary": "INSURED INFORMATION"
+        },
+        {
+          "title": "PHYSICIAN'S INSTRUCTIONS",
+          "node_id": "0002",
+          "start_index": 1,
+          "end_index": 1,
+          "summary": "PHYSICIAN'S INSTRUCTIONS"
+        },
+        {
+          "title": "DIAGNOSIS",
+          "node_id": "0003",
+          "start_index": 1,
+          "end_index": 1,
+          "summary": "DIAGNOSIS",
+          "nodes": [
+            {
+              "title": "Primary Diagnosis",
+              "node_id": "0004",
+              "start_index": 1,
+              "end_index": 1,
+              "summary": "Primary Diagnosis"
+            },
+            {
+              "title": "Secondary Diagnosis(es)",
+              "node_id": "0005",
+              "start_index": 1,
+              "end_index": 1,
+              "summary": "Secondary Diagnosis(es)"
+            },
+            {
+              "title": "Subjective Symptoms",
+              "node_id": "0006",
+              "start_index": 1,
+              "end_index": 1,
+              "summary": "Subjective Symptoms"
+            },
+            {
+              "title": "Physician's Examination Findings",
+              "node_id": "0007",
+              "start_index": 1,
+              "end_index": 1,
+              "summary": "Physician's Examination Findings"
+            },
+            {
+              "title": "Date Symptoms First Appeared/Accident Occurred",
+              "node_id": "0008",
+              "start_index": 1,
+              "end_index": 1,
+              "summary": "Date Symptoms First Appeared/Accident Occurred"
+            },
+            {
+              "title": "Date Total Disability began",
+              "node_id": "0009",
+              "start_index": 1,
+              "end_index": 1,
+              "summary": "Date Total Disability began"
+            },
+            {
+              "title": "Has patient ever had the same or similar condition?",
+              "node_id": "0010",
+              "start_index": 1,
+              "end_index": 1,
+              "summary": "Has patient ever had the same or similar condition?"
+            },
+            {
+              "title": "Current symptoms which support the above diagnosis",
+              "node_id": "0011",
+              "start_index": 1,
+              "end_index": 1,
+              "summary": "Current symptoms which support the above diagnosis"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "title": "TREATMENT",
+      "node_id": "0012",
+      "start_index": 2,
+      "end_index": 2,
+      "summary": "TREATMENT",
+      "nodes": [
+        {
+          "title": "Date of onset of this condition",
+          "node_id": "0013",
+          "start_index": 2,
+          "end_index": 2,
+          "summary": "Date of onset of this condition"
+        },
+        {
+          "title": "Date you first treated this patient for this condition",
+          "node_id": "0014",
+          "start_index": 2,
+          "end_index": 2,
+          "summary": "Date you first treated this patient for this condition"
+        },
+        {
+          "title": "Date of most recent visit",
+          "node_id": "0015",
+          "start_index": 2,
+          "end_index": 2,
+          "summary": "Date of most recent visit"
+        },
+        {
+          "title": "Date of next office visit",
+          "node_id": "0016",
+          "start_index": 2,
+          "end_index": 2,
+          "summary": "Date of next office visit"
+        },
+        {
+          "title": "Frequency of Visits",
+          "node_id": "0017",
+          "start_index": 2,
+          "end_index": 2,
+          "summary": "Frequency of Visits"
+        },
+        {
+          "title": "Referral Information",
+          "node_id": "0018",
+          "start_index": 2,
+          "end_index": 2,
+          "summary": "Referral Information"
+        },
+        {
+          "title": "Current and recommended treatment plans",
+          "node_id": "0019",
+          "start_index": 2,
+          "end_index": 2,
+          "summary": "Current and recommended treatment plans"
+        },
+        {
+          "title": "Surgery Information",
+          "node_id": "0020",
+          "start_index": 2,
+          "end_index": 2,
+          "summary": "Surgery Information"
+        },
+        {
+          "title": "Hospitalization Information",
+          "node_id": "0021",
+          "start_index": 2,
+          "end_index": 2,
+          "summary": "Hospitalization Information"
+        },
+        {
+          "title": "Progress",
+          "node_id": "0022",
+          "start_index": 2,
+          "end_index": 2,
+          "summary": "Progress"
+        },
+        {
+          "title": "Patient's current status",
+          "node_id": "0023",
+          "start_index": 2,
+          "end_index": 2,
+          "summary": "Patient's current status"
+        }
+      ]
+    },
+    {
+      "title": "LEVEL OF FUNCTIONAL IMPAIRMENT",
+      "node_id": "0024",
+      "start_index": 2,
+      "end_index": 2,
+      "summary": "LEVEL OF FUNCTIONAL IMPAIRMENT",
+      "nodes": [
+        {
+          "title": "Work hour recommendations",
+          "node_id": "0025",
+          "start_index": 2,
+          "end_index": 2,
+          "summary": "Work hour recommendations"
+        },
+        {
+          "title": "Last examination date",
+          "node_id": "0026",
+          "start_index": 2,
+          "end_index": 2,
+          "summary": "Last examination date"
+        }
+      ]
+    },
+    {
+      "title": "PSYCHIATRIC IMPAIRMENT",
+      "node_id": "0027",
+      "start_index": 3,
+      "end_index": 3,
+      "summary": "PSYCHIATRIC IMPAIRMENT",
+      "nodes": [
+        {
+          "title": "Current GAF",
+          "node_id": "0028",
+          "start_index": 3,
+          "end_index": 3,
+          "summary": "Current GAF"
+        },
+        {
+          "title": "Competency to endorse checks",
+          "node_id": "0029",
+          "start_index": 3,
+          "end_index": 3,
+          "summary": "Competency to endorse checks"
+        }
+      ]
+    },
+    {
+      "title": "CARDIAC IMPAIRMENT",
+      "node_id": "0030",
+      "start_index": 3,
+      "end_index": 3,
+      "summary": "CARDIAC IMPAIRMENT",
+      "nodes": [
+        {
+          "title": "Functional Capacity",
+          "node_id": "0031",
+          "start_index": 3,
+          "end_index": 3,
+          "summary": "Functional Capacity"
+        },
+        {
+          "title": "Blood Pressure",
+          "node_id": "0032",
+          "start_index": 3,
+          "end_index": 3,
+          "summary": "Blood Pressure"
+        }
+      ]
+    },
+    {
+      "title": "VISUAL IMPAIRMENT",
+      "node_id": "0033",
+      "start_index": 4,
+      "end_index": 4,
+      "summary": "VISUAL IMPAIRMENT",
+      "nodes": [
+        {
+          "title": "Vision observations",
+          "node_id": "0034",
+          "start_index": 4,
+          "end_index": 4,
+          "summary": "Vision observations"
+        }
+      ]
+    },
+    {
+      "title": "HEARING IMPAIRMENT",
+      "node_id": "0035",
+      "start_index": 4,
+      "end_index": 4,
+      "summary": "HEARING IMPAIRMENT",
+      "nodes": [
+        {
+          "title": "Hearing test results",
+          "node_id": "0036",
+          "start_index": 4,
+          "end_index": 4,
+          "summary": "Hearing test results"
+        }
+      ]
+    },
+    {
+      "title": "PHYSICAL CAPACITIES EVALUATION",
+      "node_id": "0037",
+      "start_index": 5,
+      "end_index": 5,
+      "summary": "PHYSICAL CAPACITIES EVALUATION",
+      "nodes": [
+        {
+          "title": "Patient's standing ability",
+          "node_id": "0038",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Patient's standing ability"
+        },
+        {
+          "title": "Patient's walking ability",
+          "node_id": "0039",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Patient's walking ability"
+        },
+        {
+          "title": "Patient's sitting ability",
+          "node_id": "0040",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Patient's sitting ability"
+        },
+        {
+          "title": "Patient's driving ability",
+          "node_id": "0041",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Patient's driving ability"
+        },
+        {
+          "title": "Lifting ability",
+          "node_id": "0042",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Lifting ability"
+        },
+        {
+          "title": "Carrying ability",
+          "node_id": "0043",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Carrying ability"
+        },
+        {
+          "title": "Bending/Twisting abilities",
+          "node_id": "0044",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Bending/Twisting abilities"
+        }
+      ]
+    },
+    {
+      "title": "HANDLING RESTRICTIONS",
+      "node_id": "0045",
+      "start_index": 6,
+      "end_index": 6,
+      "summary": "HANDLING RESTRICTIONS",
+      "nodes": [
+        {
+          "title": "Activity restrictions",
+          "node_id": "0046",
+          "start_index": 6,
+          "end_index": 6,
+          "summary": "Activity restrictions"
+        }
+      ]
+    },
+    {
+      "title": "PHYSICIAN INFORMATION AND SIGNATURE",
+      "node_id": "0047",
+      "start_index": 6,
+      "end_index": 6,
+      "summary": "PHYSICIAN INFORMATION AND SIGNATURE"
+    }
+  ],
+  "page_count": 6
+}

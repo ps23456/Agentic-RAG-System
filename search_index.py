@@ -264,10 +264,16 @@ class SearchIndex:
         if metadata_filter:
             clauses = []
             for k, v in metadata_filter.items():
-                if not v:
+                if v is None or (isinstance(v, (list, str)) and not v):
                     continue
                 if k in ("patient_name", "doctor_name"):
-                    variants = list({v, v.upper(), v.title(), " ".join(w.capitalize() for w in v.split())})
+                    # v can be str or list (OCR variants: ["Rita Pepper", "Rika Popper", "Rita Peyer"])
+                    if isinstance(v, list):
+                        variants = list(dict.fromkeys(str(x).strip() for x in v if x))
+                    else:
+                        variants = list({v, str(v).upper(), str(v).title(), " ".join(w.capitalize() for w in str(v).split())})
+                    if not variants:
+                        continue
                     if len(variants) == 1:
                         clauses.append({k: {"$eq": variants[0]}})
                     else:
@@ -364,14 +370,18 @@ class SearchIndex:
         return out
 
     def _chunk_matches_filter(self, chunk: Chunk, metadata_filter: dict | None) -> bool:
-        """Return True if chunk matches metadata_filter (or filter is empty)."""
+        """Return True if chunk matches metadata_filter (or filter is empty).
+        For patient_name/doctor_name, v can be list of OCR variants."""
         if not metadata_filter:
             return True
         for k, v in metadata_filter.items():
-            if not v:
+            if v is None or (isinstance(v, (list, str)) and not v):
                 continue
-            chunk_val = getattr(chunk, k, "")
-            if chunk_val != v:
+            chunk_val = getattr(chunk, k, "") or ""
+            if k in ("patient_name", "doctor_name") and isinstance(v, list):
+                if chunk_val not in v:
+                    return False
+            elif chunk_val != v:
                 return False
         return True
 

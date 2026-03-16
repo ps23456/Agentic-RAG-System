@@ -1,0 +1,200 @@
+{
+  "file_name": "PNB AR 2024-25_Web.pdf",
+  "file_path": "/Users/pshah/testing 3/data/uploads/PNB AR 2024-25_Web.pdf",
+  "nodes": [
+    {
+      "title": "Notice",
+      "node_id": "0000",
+      "start_index": 1,
+      "end_index": 38,
+      "summary": "Notice"
+    },
+    {
+      "title": "Directors’ Report",
+      "node_id": "0001",
+      "start_index": 39,
+      "end_index": 82,
+      "summary": "Directors’ Report"
+    },
+    {
+      "title": "Management Discussion and Analysis",
+      "node_id": "0002",
+      "start_index": 83,
+      "end_index": 129,
+      "summary": "Management Discussion and Analysis"
+    },
+    {
+      "title": "Auditors’ Certificate on Corporate Governance",
+      "node_id": "0003",
+      "start_index": 130,
+      "end_index": 131,
+      "summary": "Auditors’ Certificate on Corporate Governance"
+    },
+    {
+      "title": "Report on Corporate Governance",
+      "node_id": "0004",
+      "start_index": 132,
+      "end_index": 199,
+      "summary": "Report on Corporate Governance"
+    },
+    {
+      "title": "Secretarial Audit Report",
+      "node_id": "0005",
+      "start_index": 200,
+      "end_index": 207,
+      "summary": "Secretarial Audit Report"
+    },
+    {
+      "title": "Certificate of Non-Disqualification of Directors",
+      "node_id": "0006",
+      "start_index": 208,
+      "end_index": 210,
+      "summary": "Certificate of Non-Disqualification of Directors"
+    },
+    {
+      "title": "Business Responsibility and Sustainability Report",
+      "node_id": "0007",
+      "start_index": 211,
+      "end_index": 272,
+      "summary": "Business Responsibility and Sustainability Report"
+    },
+    {
+      "title": "Auditors’ Certificate on Business Responsibility and Sustainability Report",
+      "node_id": "0008",
+      "start_index": 273,
+      "end_index": 284,
+      "summary": "Auditors’ Certificate on Business Responsibility and Sustainability Report"
+    },
+    {
+      "title": "Corporate Social Responsibility Report",
+      "node_id": "0009",
+      "start_index": 285,
+      "end_index": 302,
+      "summary": "Corporate Social Responsibility Report"
+    },
+    {
+      "title": "Disclosure under Basel III Framework",
+      "node_id": "0010",
+      "start_index": 303,
+      "end_index": 304,
+      "summary": "Disclosure under Basel III Framework"
+    },
+    {
+      "title": "Standalone Financial Statements",
+      "node_id": "0011",
+      "start_index": 305,
+      "end_index": 450,
+      "summary": "Standalone Financial Statements",
+      "nodes": [
+        {
+          "title": "Auditors’ Report",
+          "node_id": "0012",
+          "start_index": 306,
+          "end_index": 318,
+          "summary": "Auditors’ Report"
+        },
+        {
+          "title": "Balance Sheet",
+          "node_id": "0013",
+          "start_index": 319,
+          "end_index": 320,
+          "summary": "Balance Sheet"
+        },
+        {
+          "title": "Profit & Loss Account",
+          "node_id": "0014",
+          "start_index": 321,
+          "end_index": 323,
+          "summary": "Profit & Loss Account"
+        },
+        {
+          "title": "Schedules",
+          "node_id": "0015",
+          "start_index": 324,
+          "end_index": 336,
+          "summary": "Schedules"
+        },
+        {
+          "title": "Significant Accounting Policies",
+          "node_id": "0016",
+          "start_index": 337,
+          "end_index": 356,
+          "summary": "Significant Accounting Policies"
+        },
+        {
+          "title": "Notes to Accounts",
+          "node_id": "0017",
+          "start_index": 357,
+          "end_index": 445,
+          "summary": "Notes to Accounts"
+        },
+        {
+          "title": "Cash Flow Statement",
+          "node_id": "0018",
+          "start_index": 446,
+          "end_index": 450,
+          "summary": "Cash Flow Statement"
+        }
+      ]
+    },
+    {
+      "title": "Consolidated Financial Statements",
+      "node_id": "0019",
+      "start_index": 451,
+      "end_index": 560,
+      "summary": "Consolidated Financial Statements",
+      "nodes": [
+        {
+          "title": "Auditors’ Report",
+          "node_id": "0020",
+          "start_index": 452,
+          "end_index": 464,
+          "summary": "Auditors’ Report"
+        },
+        {
+          "title": "Balance Sheet",
+          "node_id": "0021",
+          "start_index": 465,
+          "end_index": 466,
+          "summary": "Balance Sheet"
+        },
+        {
+          "title": "Profit & Loss Account",
+          "node_id": "0022",
+          "start_index": 467,
+          "end_index": 469,
+          "summary": "Profit & Loss Account"
+        },
+        {
+          "title": "Schedules",
+          "node_id": "0023",
+          "start_index": 470,
+          "end_index": 482,
+          "summary": "Schedules"
+        },
+        {
+          "title": "Significant Accounting Policies",
+          "node_id": "0024",
+          "start_index": 483,
+          "end_index": 504,
+          "summary": "Significant Accounting Policies"
+        },
+        {
+          "title": "Notes to Accounts",
+          "node_id": "0025",
+          "start_index": 505,
+          "end_index": 529,
+          "summary": "Notes to Accounts"
+        },
+        {
+          "title": "Cash Flow Statement",
+          "node_id": "0026",
+          "start_index": 530,
+          "end_index": 560,
+          "summary": "Cash Flow Statement"
+        }
+      ]
+    }
+  ],
+  "page_count": 560
+}

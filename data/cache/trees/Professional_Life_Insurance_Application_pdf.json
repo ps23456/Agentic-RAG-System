@@ -1,0 +1,186 @@
+{
+  "file_name": "Professional_Life_Insurance_Application.pdf",
+  "file_path": "/Users/pshah/testing 3/data/uploads/Professional_Life_Insurance_Application.pdf",
+  "nodes": [
+    {
+      "title": "EMPLOYMENT AND FINANCIAL INFORMATION",
+      "node_id": "0000",
+      "start_index": 3,
+      "end_index": 4,
+      "summary": "EMPLOYMENT AND FINANCIAL INFORMATION"
+    },
+    {
+      "title": "POLICY INFORMATION",
+      "node_id": "0001",
+      "start_index": 5,
+      "end_index": 15,
+      "summary": "POLICY INFORMATION",
+      "nodes": [
+        {
+          "title": "Policy Type",
+          "node_id": "0002",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Policy Type"
+        },
+        {
+          "title": "Coverage Amount",
+          "node_id": "0003",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Coverage Amount"
+        },
+        {
+          "title": "Policy Term",
+          "node_id": "0004",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Policy Term"
+        },
+        {
+          "title": "Premium Payment Term",
+          "node_id": "0005",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Premium Payment Term"
+        },
+        {
+          "title": "Premium Mode",
+          "node_id": "0006",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Premium Mode"
+        },
+        {
+          "title": "Annual Premium",
+          "node_id": "0007",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Annual Premium"
+        },
+        {
+          "title": "First Premium Due Date",
+          "node_id": "0008",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "First Premium Due Date"
+        },
+        {
+          "title": "Policy Effective Date",
+          "node_id": "0009",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Policy Effective Date"
+        },
+        {
+          "title": "Policy Features Selected",
+          "node_id": "0010",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Policy Features Selected"
+        },
+        {
+          "title": "Dividend Option",
+          "node_id": "0011",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Dividend Option"
+        },
+        {
+          "title": "Automatic Premium Loan",
+          "node_id": "0012",
+          "start_index": 5,
+          "end_index": 5,
+          "summary": "Automatic Premium Loan"
+        },
+        {
+          "title": "Premium Breakdown",
+          "node_id": "0013",
+          "start_index": 6,
+          "end_index": 15,
+          "summary": "Premium Breakdown",
+          "nodes": [
+            {
+              "title": "Base Policy Premium",
+              "node_id": "0014",
+              "start_index": 6,
+              "end_index": 15,
+              "summary": "Base Policy Premium"
+            },
+            {
+              "title": "Accelerated Death Benefit Rider",
+              "node_id": "0015",
+              "start_index": 6,
+              "end_index": 15,
+              "summary": "Accelerated Death Benefit Rider"
+            },
+            {
+              "title": "Waiver of Premium Rider",
+              "node_id": "0016",
+              "start_index": 6,
+              "end_index": 15,
+              "summary": "Waiver of Premium Rider"
+            },
+            {
+              "title": "Accidental Death Benefit Rider",
+              "node_id": "0017",
+              "start_index": 6,
+              "end_index": 15,
+              "summary": "Accidental Death Benefit Rider"
+            },
+            {
+              "title": "Guaranteed Insurability Rider",
+              "node_id": "0018",
+              "start_index": 6,
+              "end_index": 15,
+              "summary": "Guaranteed Insurability Rider"
+            },
+            {
+              "title": "Disability Income Rider",
+              "node_id": "0019",
+              "start_index": 6,
+              "end_index": 15,
+              "summary": "Disability Income Rider"
+            },
+            {
+              "title": "Children's Term Rider",
+              "node_id": "0020",
+              "start_index": 6,
+              "end_index": 15,
+              "summary": "Children's Term Rider"
+            },
+            {
+              "title": "Subtotal - Policy and Riders",
+              "node_id": "0021",
+              "start_index": 6,
+              "end_index": 15,
+              "summary": "Subtotal - Policy and Riders"
+            }
+          ]
+        },
+        {
+          "title": "State Premium Tax (2.0%)",
+          "node_id": "0022",
+          "start_index": 6,
+          "end_index": 15,
+          "summary": "State Premium Tax (2.0%)"
+        },
+        {
+          "title": "Policy Fee (Annual)",
+          "node_id": "0023",
+          "start_index": 6,
+          "end_index": 15,
+          "summary": "Policy Fee (Annual)"
+        },
+        {
+          "title": "Total Annual Premium Due",
+          "node_id": "0024",
+          "start_index": 6,
+          "end_index": 15,
+          "summary": "Total Annual Premium Due"
+        }
+      ]
+    }
+  ],
+  "page_count": 15
+}
