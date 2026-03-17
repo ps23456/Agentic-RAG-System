@@ -914,16 +914,13 @@ def main():
                 st.write("**List-patients intent:**", detect_list_patients_intent(query_mh))
                 st.write("**known_patients:**", robust_catalog.get("known_patients") or catalog_mh.get("known_patients"))
 
-        # Tree search: run in parallel with chunk retrieval when "both" for speed
-        # Cache results in session_state so source-button clicks don't re-trigger search
+        # Tree search / summary caching
         tree_fused = []
-        tree_future = None
-        _tree_exec = None
         tree_summary = ""
         tree_sources = []
         _tree_cache_key = f"_tree_cache_{hash(query_mh)}"
         _tree_cached = st.session_state.get(_tree_cache_key)
-        if indexing_mode_mh in ("tree", "both") and st.session_state.page_trees:
+        if indexing_mode_mh == "tree" and st.session_state.page_trees:
             if _tree_cached and _tree_cached.get("query") == query_mh:
                 tree_fused = _tree_cached.get("fused", [])
                 tree_summary = _tree_cached.get("summary", "")
@@ -931,18 +928,14 @@ def main():
             else:
                 from indexing.page_tree import tree_search
                 llm_key_mh, _prov = _resolve_llm_for_tree(llm_provider, llm_api_key)
-                if indexing_mode_mh == "both":
-                    _tree_exec = ThreadPoolExecutor(max_workers=2)
-                    tree_future = _tree_exec.submit(tree_search, query_mh, st.session_state.page_trees, llm_key_mh, _prov, data_folder)
-                else:
-                    tree_result = tree_search(query_mh, st.session_state.page_trees, llm_key_mh, _prov, data_folder)
-                    tree_fused = [{"type": "text", "content": tc, "final_score": sc} for tc, sc in tree_result.get("chunks", [])]
-                    tree_summary = tree_result.get("summary", "")
-                    tree_sources = tree_result.get("sources", [])
-                    st.session_state[_tree_cache_key] = {
-                        "query": query_mh, "fused": tree_fused,
-                        "summary": tree_summary, "sources": tree_sources,
-                    }
+                tree_result = tree_search(query_mh, st.session_state.page_trees, llm_key_mh, _prov, data_folder)
+                tree_fused = [{"type": "text", "content": tc, "final_score": sc} for tc, sc in tree_result.get("chunks", [])]
+                tree_summary = tree_result.get("summary", "")
+                tree_sources = tree_result.get("sources", [])
+                st.session_state[_tree_cache_key] = {
+                    "query": query_mh, "fused": tree_fused,
+                    "summary": tree_summary, "sources": tree_sources,
+                }
 
         if indexing_mode_mh == "tree":
             fused = tree_fused
@@ -960,6 +953,7 @@ def main():
         elif use_agentic_rag and index:
             # Agentic RAG: understand query → route to correct retrieval
             # When agentic is ON, always use LLM if any key is available
+            _both_trees = st.session_state.page_trees if indexing_mode_mh == "both" and st.session_state.page_trees else None
             with st.spinner("Agentic RAG: understanding query & retrieving..."):
                 text_retriever = TextRetriever(index)
                 image_retriever = ImageRetriever()
@@ -973,6 +967,8 @@ def main():
                     use_llm=True,
                     llm_api_key=llm_api_key or "",
                     llm_provider=llm_provider or "",
+                    page_trees=_both_trees,
+                    data_folder=data_folder if _both_trees else None,
                 )
                 if understanding_mh and understanding_mh.get("metadata_filter"):
                     st.caption(
@@ -1053,29 +1049,22 @@ def main():
                         fused = diversify_fused_results(fused, entity_key="patient_name", top_k=MULTIMODAL_HYBRID_TOP_K, max_per_entity=METADATA_DIVERSITY_MAX_PER_ENTITY)
             direct_answer = understanding_mh.get("direct_answer") if understanding_mh else None
 
-        # Both mode: get tree results (from parallel run) and prepend to fused
-        if indexing_mode_mh == "both" and tree_future is not None:
-            try:
-                tree_result = tree_future.result(timeout=90)
-                tree_fused = [{"type": "text", "content": tc, "final_score": sc} for tc, sc in tree_result.get("chunks", [])]
-                tree_summary = tree_result.get("summary", "")
-                tree_sources = tree_result.get("sources", [])
+        # Both mode: generate LLM summary from the fused results (post-fusion)
+        if indexing_mode_mh == "both" and fused and st.session_state.page_trees:
+            if _tree_cached and _tree_cached.get("query") == query_mh:
+                tree_summary = _tree_cached.get("summary", "")
+                tree_sources = _tree_cached.get("sources", [])
+            else:
+                from indexing.page_tree import generate_summary_from_results
+                llm_key_mh, _prov = _resolve_llm_for_tree(llm_provider, llm_api_key)
+                with st.spinner("Generating PageIndex summary from fused results..."):
+                    tree_summary, tree_sources = generate_summary_from_results(
+                        query_mh, fused, llm_key_mh, _prov,
+                    )
                 st.session_state[_tree_cache_key] = {
-                    "query": query_mh, "fused": tree_fused,
+                    "query": query_mh, "fused": fused,
                     "summary": tree_summary, "sources": tree_sources,
                 }
-            except Exception:
-                tree_fused = []
-            if _tree_exec:
-                _tree_exec.shutdown(wait=False)
-        if indexing_mode_mh == "both" and tree_fused and fused:
-            seen_ids = {getattr(r["content"], "chunk_id", None) for r in fused if r["type"] == "text"}
-            for tr in tree_fused:
-                cid = getattr(tr["content"], "chunk_id", None)
-                if cid and cid not in seen_ids:
-                    fused.insert(0, tr)
-                    seen_ids.add(cid)
-            fused = fused[:15]
 
         # For debug display: derive text_results/image_results from fused
         if indexing_mode_mh == "tree" or use_agentic_rag:
@@ -1112,7 +1101,7 @@ def main():
             col_summary, col_viewer = st.columns([55, 45], gap="medium")
 
             with col_summary:
-                st.subheader("PageIndex Results")
+                st.subheader("Hierarchical Tree Method")
                 st.markdown(tree_summary)
 
                 # Source buttons
@@ -1152,7 +1141,8 @@ def main():
                         if _vs_fname in files:
                             _vs_path = os.path.join(root, _vs_fname)
                             break
-                    if _vs_path and os.path.isfile(_vs_path) and _vs_path.lower().endswith(".pdf"):
+                    _vs_ext = os.path.splitext(_vs_fname)[1].lower() if _vs_fname else ""
+                    if _vs_path and os.path.isfile(_vs_path) and _vs_ext == ".pdf":
                         try:
                             import fitz as _fitz_tree
                             import io as _io_tree
@@ -1160,7 +1150,6 @@ def main():
                             doc = _fitz_tree.open(_vs_path)
                             total_pages = len(doc)
 
-                            # Page navigation
                             nav_cols = st.columns([1, 3, 1])
                             with nav_cols[0]:
                                 if _vs_page > 1:
@@ -1185,8 +1174,24 @@ def main():
                             doc.close()
                         except Exception as _e_tree:
                             st.warning(f"Could not render page: {_e_tree}")
+                    elif _vs_path and os.path.isfile(_vs_path) and _vs_ext in (".md", ".txt", ".csv"):
+                        st.markdown(f"<div style='text-align:center'><b>{_vs_fname}</b></div>", unsafe_allow_html=True)
+                        try:
+                            with open(_vs_path, "r", encoding="utf-8", errors="replace") as _f_view:
+                                _file_content = _f_view.read()
+                            if _vs_ext == ".md":
+                                st.markdown(_file_content)
+                            else:
+                                st.code(_file_content, language=None)
+                        except Exception as _e_text:
+                            st.warning(f"Could not read file: {_e_text}")
+                    elif _vs_path and os.path.isfile(_vs_path) and _vs_ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"):
+                        st.markdown(f"<div style='text-align:center'><b>{_vs_fname}</b></div>", unsafe_allow_html=True)
+                        st.image(_vs_path, use_container_width=True)
+                    elif _vs_path and os.path.isfile(_vs_path):
+                        st.info(f"Viewer not available for {_vs_ext} files: {_vs_fname}")
                     else:
-                        st.info(f"PDF not found: {_vs_fname}")
+                        st.info(f"File not found: {_vs_fname}")
                 else:
                     st.caption("Click a source to view the PDF page here.")
 

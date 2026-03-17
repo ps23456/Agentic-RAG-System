@@ -704,6 +704,8 @@ def run_agentic_rag(
     use_llm: bool = True,
     llm_api_key: str = "",
     llm_provider: str = "groq",
+    page_trees: list | None = None,
+    data_folder: str | None = None,
 ) -> tuple[dict | None, list[dict], str | None]:
     """
     Autonomous agentic RAG:
@@ -819,6 +821,17 @@ def run_agentic_rag(
             boost_ocr=(query_type == "text_heavy"),
             main_intent_keywords=main_intent_keywords,
         )
+
+        if page_trees:
+            from indexing.page_tree import tree_keyword_retrieve
+            tree_hits = tree_keyword_retrieve(query, page_trees, data_folder)
+            seen_tree = {c.chunk_id for c, _ in text_results}
+            for tc, sc in tree_hits:
+                if tc.chunk_id not in seen_tree:
+                    text_results.append((tc, sc))
+                    seen_tree.add(tc.chunk_id)
+            text_results.sort(key=lambda x: x[1], reverse=True)
+
         verbatim = []
         if index and hasattr(index, "verbatim_search"):
             verbatim = index.verbatim_search(query, metadata_filter or None, max_results=10)

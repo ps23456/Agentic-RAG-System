@@ -829,6 +829,157 @@ def _collect_all_leaf_ranges(nodes: list) -> list[dict]:
     return leaves
 
 
+def tree_keyword_retrieve(
+    query: str,
+    trees: List[dict],
+    data_folder: str | None = None,
+    top_k: int = 15,
+) -> list[tuple["TreeChunk", float]]:
+    """
+    Fast, LLM-free keyword retrieval from tree-indexed PDFs.
+    Uses fitz to scan pages for query terms and returns (TreeChunk, score) pairs
+    compatible with text_results in the agentic RAG fusion pipeline.
+    """
+    if not trees:
+        return []
+
+    data_folder = data_folder or DATA_FOLDER
+    q_lower = query.lower().strip()
+    q_words = [w for w in re.findall(r'[a-z]+', q_lower) if len(w) >= 4]
+
+    all_hits: list[tuple[TreeChunk, float]] = []
+    max_raw_score = 1  # track for normalization
+
+    for tree in trees:
+        file_path = _resolve_pdf_path(tree, data_folder)
+        if not file_path:
+            continue
+        try:
+            import fitz
+            doc = fitz.open(file_path)
+            page_scores: list[tuple[int, str, int]] = []
+            for pg_idx in range(len(doc)):
+                text = doc.load_page(pg_idx).get_text()
+                text_lower = text.lower()
+                score = 0
+                if q_lower in text_lower:
+                    score += 10
+                for w in q_words:
+                    if w in text_lower:
+                        score += 1
+                if score > 0:
+                    page_scores.append((pg_idx + 1, text, score))
+                    if score > max_raw_score:
+                        max_raw_score = score
+            doc.close()
+        except Exception as e:
+            logger.warning("tree_keyword_retrieve scan failed for %s: %s", file_path, e)
+            continue
+
+        page_scores.sort(key=lambda x: -x[2])
+
+        leaves = _collect_all_leaf_ranges(tree.get("nodes", []))
+
+        def _section_for_page(pg: int) -> str:
+            for lf in leaves:
+                if lf.get("start_index", 0) <= pg <= lf.get("end_index", 0):
+                    return lf.get("title", "")
+            return ""
+
+        for pg_num, pg_text, raw_score in page_scores[:top_k]:
+            tc = TreeChunk(
+                chunk_id=f"tree_kw_{tree.get('file_name', '')}_{pg_num}",
+                text=pg_text[:12000],
+                file_name=tree.get("file_name", ""),
+                page_number=pg_num,
+            )
+            tc._section_title = _section_for_page(pg_num)
+            normalized = min(1.0, raw_score / max(max_raw_score, 1))
+            all_hits.append((tc, normalized))
+
+    all_hits.sort(key=lambda x: -x[1])
+    return all_hits[:top_k]
+
+
+def generate_summary_from_results(
+    query: str,
+    fused_results: list[dict],
+    api_key: str,
+    provider: str = "openai",
+) -> tuple[str, list[dict]]:
+    """
+    Generate a PageIndex-style markdown summary from fused results (post-fusion).
+    Handles both text chunks (Chunk/TreeChunk objects) and image results (dicts).
+    Returns (summary_markdown, source_citations).
+    """
+    top_items = fused_results[:5]
+    if not top_items:
+        return "", []
+
+    content_parts = []
+    sources = []
+    seen_sources = set()
+    for r in top_items:
+        content = r["content"]
+        if r.get("type") == "image" and isinstance(content, dict):
+            fname = content.get("file_name", "")
+            pg = content.get("page", "?")
+            ocr = content.get("ocr_text", "") or ""
+            # For PDF images, read the actual page text for richer context
+            page_text = ""
+            if fname and str(pg).isdigit() and fname.lower().endswith(".pdf"):
+                img_path = content.get("path", "")
+                pdf_dir = os.path.dirname(img_path) if img_path else ""
+                pdf_path = os.path.join(pdf_dir, fname) if pdf_dir else ""
+                if not pdf_path or not os.path.isfile(pdf_path):
+                    pdf_path = os.path.join(DATA_FOLDER, fname)
+                if not os.path.isfile(pdf_path):
+                    pdf_path = os.path.join(DATA_FOLDER, "uploads", fname)
+                if os.path.isfile(pdf_path):
+                    nearby = _read_pdf_page_range(pdf_path, int(pg), int(pg))
+                    page_text = nearby[0][1][:2500] if nearby else ""
+            txt = page_text or ocr[:3000] or f"[Image from {fname} page {pg}]"
+            content_parts.append(f"[Source: {fname} p.{pg}]\n{txt}")
+        else:
+            fname = getattr(content, "file_name", "") or ""
+            pg = getattr(content, "page_number", None) or "?"
+            txt = (getattr(content, "text", "") or "")[:3000]
+            content_parts.append(f"[Source: {fname} p.{pg}]\n{txt}")
+        src_key = (fname, str(pg))
+        if src_key not in seen_sources:
+            seen_sources.add(src_key)
+            section = ""
+            if r.get("type") != "image":
+                section = getattr(content, "_section_title", "") or ""
+            sources.append({
+                "file_name": fname,
+                "page": pg,
+                "title": section or fname,
+            })
+
+    summary_input = "\n\n---\n\n".join(content_parts)
+    if len(summary_input) > 20000:
+        summary_input = summary_input[:20000]
+
+    prompt = f"""Based on the following document excerpts, answer the user's question with a clear, well-structured summary.
+
+Question: "{query}"
+
+Document excerpts:
+{summary_input}
+
+INSTRUCTIONS:
+- Write a clear, structured answer using ONLY information from the excerpts
+- Use markdown headers (##) for major topics
+- Use bullet points for key details
+- Include specific data, numbers, and facts
+- If content is in a non-English language, summarize the key points in English
+- Be concise but comprehensive"""
+
+    summary = _call_llm_tree(prompt, api_key, provider, max_tokens=2000) or ""
+    return summary, sources
+
+
 def tree_search(
     query: str,
     trees: List[dict],
