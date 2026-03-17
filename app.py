@@ -1088,12 +1088,14 @@ def main():
                     seen_sources.add(key)
                     unique_sources.append(src)
 
-            # Auto-select the first source if none selected yet
-            if unique_sources and "_tree_view_src" not in st.session_state:
+            # Auto-select the first source when query changes or no source selected
+            _prev_tree_query = st.session_state.get("_tree_view_query", "")
+            if unique_sources and (_prev_tree_query != query_mh or "_tree_view_src" not in st.session_state):
                 st.session_state["_tree_view_src"] = {
                     "file_name": unique_sources[0].get("file_name", ""),
                     "page": unique_sources[0].get("page", 1),
                 }
+                st.session_state["_tree_view_query"] = query_mh
 
             view_src = st.session_state.get("_tree_view_src")
 
