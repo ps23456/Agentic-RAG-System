@@ -30,3 +30,7 @@ opencv-python>=4.8,<4.10
 docling>=2.0.0
 # Mistral OCR
 mistralai>=1.0.0
+# FastAPI backend
+fastapi>=0.104.0
+uvicorn>=0.24.0
+python-multipart>=0.0.6
