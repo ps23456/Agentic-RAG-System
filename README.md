@@ -1,126 +1,142 @@
-# Insurance Claim Search (Local Prototype)
+# Insurance Claim Search
 
-Self-contained prototype for searching over **policy PDFs**, **claim PDFs**, and **medical reports** in a local folder. Supports **BM25** (keyword), **Vector** (semantic), and **Hybrid** (fusion) search with side-by-side comparison.
+Local-first prototype for searching **policy PDFs**, **claim documents**, and **medical reports** in a folder you control. It combines **BM25** (keyword), **dense vector** (semantic) search, and **hybrid fusion** (Reciprocal Rank Fusion), with optional **RAG chat**, **multimodal** (text + image) retrieval, and **PageIndex-style hierarchical tree** indexing over PDFs.
 
-## Tech Stack
+## Architecture
 
-- **Python** + **Streamlit**
-- **BM25**: rank-bm25
-- **Vector**: sentence-transformers (all-MiniLM-L6-v2) + FAISS
-- **PDF**: pdfplumber, PyMuPDF
-- **OCR**: Tesseract (pytesseract + pdf2image for scanned PDFs/images)
+| Layer | Stack |
+|--------|--------|
+| **Web UI (recommended)** | React 19 + Vite + TypeScript + Tailwind — `frontend/` |
+| **API** | FastAPI — `backend/` (`uvicorn backend.main:app`) |
+| **Legacy UI** | Streamlit — `app.py` (same retrieval stack, different surface) |
+
+The Vite dev server proxies `/api` to the backend (see `frontend/vite.config.ts`).
+
+## Features (current)
+
+- **Hybrid retrieval**: BM25 + embeddings, fused with RRF; optional **CrossEncoder** reranking (`config.py`).
+- **Vector store**: **Chroma** persistent DB by default (`data/chroma/`); configurable via `VECTOR_BACKEND` / `CHROMA_*` in `config.py`.
+- **Multimodal**: Separate text and image (CLIP) collections and weighted fusion for diagram/visual queries.
+- **Tree index**: PageIndex-style TOC → hierarchical section tree (custom implementation in `indexing/page_tree.py`, inspired by [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex)). Cached JSON under `data/cache/trees/`.
+- **Document types**: Inferred from filenames (`policy*`, `claim*` / `CLM-*`, `medical*` / `*report*`, etc.) — see `config.py` `get_doc_type`.
+- **Formats**: PDF, images (OCR), Markdown, JSON, plain text uploads under `data/uploads/` by default.
+- **LLM**: Groq / OpenAI / Gemini for query understanding, chat, and tree navigation — keys via `.env` (details in [docs/LLM_SETUP.md](docs/LLM_SETUP.md)).
+
+## Requirements
+
+- **Python** 3.10+ (3.12 used in some setups)
+- **Node.js** 20+ (for the React app)
 
 ## Setup
 
-1. **Create a virtual environment and install dependencies**
+### 1. Python environment
 
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate   # Windows: .venv\Scripts\activate
-   pip install -r requirements.txt
-   pip install mistralai  # Required for Mistral OCR
-   ```
+```bash
+cd /path/to/repo
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
 
-2. **NumPy / PyTorch**
+Some teams use a separate **`.venv_bge`** for BGE M3 and heavier models — see [docs/BGE_M3_SETUP.md](docs/BGE_M3_SETUP.md). Either venv is fine if dependencies install cleanly.
 
-   - The project pins `numpy>=1.26.0,<2` to avoid the "module compiled with NumPy 1.x" error when importing PyTorch. If you see that error, run: `pip install "numpy>=1.26.0,<2"`.
-   - **PyTorch 2.2:** Run `.venv/bin/python scripts/patch_transformers_torch22.py` once after installing (or after creating a new venv). Then run the app with the project venv (e.g. `./run.sh`).
+**NumPy / PyTorch:** The repo pins `numpy>=1.26.0,<2` for compatibility with PyTorch and several ML stacks. If you see NumPy ABI errors, reinstall with that constraint.
 
-   To **search text inside uploaded images** (e.g. claim form photos, scanned docs), you can use:
-   - **Mistral OCR (Recommended):** High-accuracy cloud API. Set `MISTRAL_API_KEY` in `.env` or the sidebar. (Requires `pip install mistralai`).
-   - **Tesseract (Local):** 
-     - **macOS:** `brew install tesseract`
-     - **Ubuntu/Debian:** `sudo apt install tesseract-ocr`
-     - **Windows:** Install from [GitHub Tesseract](https://github.com/UB-Mannheim/tesseract/wiki).
+Optional one-time helper (only if your environment needs it):
 
-   Then click **Index / Re-index** in the app.
+```bash
+.venv/bin/python scripts/patch_transformers_torch22.py
+.venv/bin/python scripts/check_env.py
+```
 
-4. **Add documents to the data folder**
+### 2. Frontend dependencies
 
-   - Default folder: `data/` in the project root.
-   - Put **policy**, **claim**, and **medical** PDFs (or images) there.
-   - Document type is inferred from filename:
-     - `policy*` → policy  
-     - `claim*`, `*CLM-*` → claim  
-     - `medical*`, `*report*` → medical  
+```bash
+cd frontend
+npm install
+```
 
-5. **Optional: Generate sample PDFs for testing**
+### 3. Environment variables
 
-   ```bash
-   python scripts/create_sample_docs.py
-   ```
+Create a **`.env`** file in the project root (same level as `config.py`). It is gitignored. Common variables:
 
-   This creates `policy_terms.pdf`, `claim_CLM-8891.pdf`, and `medical_report_John_Doe.pdf` in `data/`.
+- **LLM / APIs**: e.g. `OPENAI_API_KEY`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`, `GROQ_API_KEY`, `MISTRAL_OCR_API_KEY` (see [docs/LLM_SETUP.md](docs/LLM_SETUP.md)).
+- **Data path**: `CLAIM_SEARCH_DATA` — overrides the default `data/` folder.
+- **Vector DB**: `VECTOR_BACKEND`, `CHROMA_PERSIST_DIR` (defaults in `config.py`).
 
-## Troubleshooting
+### 4. Data folder
 
-- **Python exits with code 136 or crashes on import**  
-  This can happen when the **pytesseract** (Tesseract) native library is loaded. The app now loads OCR only when needed (lazy import), so the app should start even if Tesseract isn’t installed. If it still crashes, try: `pip uninstall pytesseract` and use text PDFs only, or install Tesseract and ensure it’s on your PATH (`brew install tesseract` on macOS).
-
-- **"PyTorch is not installed"**  
-  Use the same venv for both `pip install` and `streamlit run app.py`, and run `pip install "numpy>=1.26.0,<2"` and `pip install torch` in that venv.
+By default, documents live under **`data/`** (or `CLAIM_SEARCH_DATA`). Place PDFs and other supported files there; uploads typically go to `data/uploads/`. After adding files, trigger indexing from the UI or API (see below).
 
 ## Run the app
 
-**Recommended (uses the project venv’s Python):**
+### Option A — React UI + FastAPI (recommended)
+
+**Terminal 1 — backend**
+
+```bash
+source .venv/bin/activate
+uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+**Terminal 2 — frontend**
+
+```bash
+cd frontend
+npm run dev
+```
+
+- **Frontend:** http://localhost:3000  
+- **API:** http://localhost:8000  
+- **Health check:** `GET http://localhost:8000/api/health`
+
+There is a **`run_app.sh`** script that starts both processes; it may assume a specific venv path on your machine — adjust the script or use the two-terminal flow above for portability.
+
+### Option B — Streamlit UI
+
 ```bash
 ./run.sh
 ```
 
-Or manually:
+Uses the project venv (prefers `.venv_bge` if present, else `.venv`) and runs Streamlit on port **8501**:
+
 ```bash
-source .venv/bin/activate   # or .venv\Scripts\activate on Windows
-python -m streamlit run app.py
+python -m streamlit run app.py --server.port 8501
 ```
 
-To check that the venv has all dependencies and PyTorch works:
-```bash
-.venv/bin/python scripts/check_env.py
-```
+Indexing modes (chunk-only, tree-only, or both) are exposed in the Streamlit sidebar; the React app uses the FastAPI `RAGService` configuration from `config.py`.
 
-If you reinstall or create a new venv and see "PyTorch is not installed" in the app, run the one-time patch:
-```bash
-.venv/bin/python scripts/patch_transformers_torch22.py
-```
+## API indexing (FastAPI)
 
-- In the sidebar: set **Data folder** (default: `data/`), then click **Index / Re-index documents**.
-- Enter a query, e.g.:
-  - *"Why was claim CLM-8891 rejected?"*
-  - *"Show policy clause for pre-existing conditions"*
-- View results in three columns:
-  1. **BM25** – exact/keyword matches (IDs, clauses, legal terms).
-  2. **Vector** – semantic matches (medical/insurance meaning, paraphrases).
-  3. **Hybrid** – combined ranking via Reciprocal Rank Fusion (RRF).
-- **Optional – AI -- RAG:** Use **ChatGPT** (OpenAI) or **Gemini** to get an answer generated from the retrieved chunks. See [docs/LLM_SETUP.md](docs/LLM_SETUP.md) for API keys and steps.
+- `POST /api/index` — full reindex (documents + images)  
+- `POST /api/index/docs` — documents only  
+- `POST /api/index/images` — image index only  
+- `GET /api/index/status` — indexing status  
 
-## Data source and indexing
+Chat, documents, medical, upload, and fields routes live under `backend/routes/`.
 
-- **Data source**: Only a local folder (e.g. `data/`). No cloud or external DB.
-- **On Index**: All supported files in the folder are read; text is extracted (PDF or OCR for images/scanned pages), chunked by paragraph, then indexed for BM25 and vector search.
-- **Metadata** per chunk: file name, page number, document type (policy/claim/medical).
+## Documentation (repo)
 
-## Hybrid logic
+| Doc | Topic |
+|-----|--------|
+| [docs/LLM_SETUP.md](docs/LLM_SETUP.md) | API keys and RAG / LLM usage |
+| [docs/BGE_M3_SETUP.md](docs/BGE_M3_SETUP.md) | BGE M3 embedding setup |
+| [docs/VECTOR_DB_GUIDE.md](docs/VECTOR_DB_GUIDE.md) | Chroma / vector configuration |
+| [docs/SEARCH_ARCHITECTURE.md](docs/SEARCH_ARCHITECTURE.md) | Retrieval design |
+| [docs/MULTIMODAL_HYBRID_FLOW.md](docs/MULTIMODAL_HYBRID_FLOW.md) | Multimodal hybrid RAG |
 
-- BM25 and vector search run over the same query.
-- Results are combined with **Reciprocal Rank Fusion** (RRF): `score(d) = 1/(k+rank_bm25) + 1/(k+rank_vector)`.
-- Hybrid list is sorted by this fusion score so that hits that appear in both BM25 and vector results rank higher.
+## Optional tooling
 
-## Output (retrieval-only)
+- **Sample PDFs:** `python scripts/create_sample_docs.py`  
+- **RAG evaluation:** `scripts/run_ragas_eval.py` (requires optional RAG eval deps in `requirements.txt`)  
+- **OCR:** Tesseract locally, or Mistral OCR via API — see [docs/LLM_SETUP.md](docs/LLM_SETUP.md)
 
-- Each result shows: **text snippet**, **source file**, **page number** (if available), **BM25 score** or **vector similarity** or **fusion score**.
-- No generated answers; results are explainable and auditable from your documents.
+## Troubleshooting
 
-## Environment
-
-- Override data folder: `export CLAIM_SEARCH_DATA=/path/to/your/docs`
-- First run will download the sentence-transformers model (~80MB).
+- **Wrong Python / missing packages:** Always activate the same venv you used for `pip install`, and run `uvicorn`/`streamlit` from that environment.
+- **CORS / API errors in the browser:** Ensure the backend is on port 8000 and the frontend dev server proxies `/api` (default Vite config).
+- **PyTorch / OCR import issues:** Lazy loading is used where possible; if native code crashes on import, install Tesseract on PATH or restrict to text PDFs; see [docs/LLM_SETUP.md](docs/LLM_SETUP.md) for Mistral OCR.
 
 ## Objective
 
-This prototype shows that:
-
-- **BM25** reliably finds exact policy clauses and claim IDs.
-- **Vector** search captures medical and insurance meaning.
-- **Hybrid** retrieval works on real, newly added documents and is suitable for production-style insurance claim search.
-
-Focus is on correctness and real-data behavior; the UI is kept simple and local.
+Demonstrate production-style **insurance and medical document search**: explainable retrieval (sources, pages), hybrid ranking, and optional grounded generation — all against **local data** you provide.
