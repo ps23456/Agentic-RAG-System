@@ -16,6 +16,10 @@ node_modules/
 data/chroma/
 chroma_db/
 
+# User uploads — local only; fresh installs start empty (see data/uploads/.gitkeep)
+data/uploads/*
+!data/uploads/.gitkeep
+
 # Test env (large packages)
 omnidocs_test_env/
 

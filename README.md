@@ -66,7 +66,7 @@ Create a **`.env`** file in the project root (same level as `config.py`). It is 
 
 ### 4. Data folder
 
-By default, documents live under **`data/`** (or `CLAIM_SEARCH_DATA`). Place PDFs and other supported files there; uploads typically go to `data/uploads/`. After adding files, trigger indexing from the UI or API (see below).
+By default, documents live under **`data/`** (or `CLAIM_SEARCH_DATA`). Place PDFs and other supported files there; uploads typically go to `data/uploads/`. That folder is **gitignored** so clones get an empty uploads directory and each installation keeps its own files locally. After adding files, trigger indexing from the UI or API (see below).
 
 ## Run the app
 
