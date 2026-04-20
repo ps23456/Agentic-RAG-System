@@ -1,4 +1,4 @@
-import { FileText } from "lucide-react";
+import { FileText, Globe } from "lucide-react";
 import type { Source } from "../../lib/types";
 
 interface Props {
@@ -28,7 +28,7 @@ export function SourceBadge({ source, onClick, index, active }: Props) {
           ? "bg-[var(--accent)] text-white"
           : "bg-[var(--bg-tertiary)] text-[var(--text-muted)] group-hover:bg-[var(--accent-light)] group-hover:text-[var(--accent)]"
       }`}>
-        {index ?? <FileText size={12} />}
+        {source.url ? <Globe size={12} /> : (index ?? <FileText size={12} />)}
       </div>
       <div className="min-w-0 flex-1">
         <p className={`text-[12px] font-medium truncate leading-tight ${

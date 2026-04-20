@@ -14,7 +14,9 @@ if PROJECT_ROOT not in sys.path:
 from dotenv import load_dotenv
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
-os.environ.setdefault("MISTRAL_OCR_API_KEY", "6UtP02sadSKnj7Gt6eWBJfH8MaHKWevW")
+from document_loader import set_mistral_ocr_key
+
+set_mistral_ocr_key(os.environ.get("MISTRAL_OCR_API_KEY", "").strip())
 
 
 @asynccontextmanager
@@ -39,12 +41,14 @@ from backend.routes.documents import router as documents_router
 from backend.routes.upload import router as upload_router
 from backend.routes.index import router as index_router
 from backend.routes.medical import router as medical_router
+from backend.routes.fields import router as fields_router
 
 app.include_router(chat_router)
 app.include_router(documents_router)
 app.include_router(upload_router)
 app.include_router(index_router)
 app.include_router(medical_router)
+app.include_router(fields_router)
 
 
 @app.get("/api/health")

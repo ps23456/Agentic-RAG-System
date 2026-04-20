@@ -1,0 +1,46 @@
+{
+  "file_name": "TEE_TBrown (1).pdf",
+  "file_path": "/Users/pshah/testing 3/data/uploads/TEE_TBrown (1).pdf",
+  "nodes": [
+    {
+      "title": "Introduction",
+      "node_id": "0000",
+      "start_index": 1,
+      "end_index": 1,
+      "summary": "Introduction",
+      "nodes": [
+        {
+          "title": "Education",
+          "node_id": "0001",
+          "start_index": 1,
+          "end_index": 1,
+          "summary": "Education"
+        },
+        {
+          "title": "Training",
+          "node_id": "0002",
+          "start_index": 1,
+          "end_index": 1,
+          "summary": "Training",
+          "nodes": [
+            {
+              "title": "Military Experience",
+              "node_id": "0003",
+              "start_index": 1,
+              "end_index": 1,
+              "summary": "Military Experience"
+            }
+          ]
+        },
+        {
+          "title": "Work History and Experience",
+          "node_id": "0004",
+          "start_index": 1,
+          "end_index": 1,
+          "summary": "Work History and Experience"
+        }
+      ]
+    }
+  ],
+  "page_count": 1
+}

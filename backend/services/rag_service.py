@@ -21,6 +21,8 @@ class RAGService:
         self._lock = threading.Lock()
         self._indexing = False
         self._index_status = "idle"
+        self._index_progress = 0
+        self._index_stage = ""
 
     @property
     def data_folder(self) -> str:
@@ -40,15 +42,23 @@ class RAGService:
         return os.environ.get("MISTRAL_OCR_API_KEY", "")
 
     def _llm_key_and_provider(self) -> tuple[str, str]:
+        """Groq first; fallback to OpenAI when Groq key is missing."""
         k = self._groq_key()
         if k:
             return k, "groq"
         k = self._openai_key()
         if k:
             return k, "openai"
-        return "", "groq"
+        return "", "openai"
 
     def initialize(self):
+        try:
+            from document_loader import set_mistral_ocr_key
+
+            set_mistral_ocr_key(os.environ.get("MISTRAL_OCR_API_KEY", "").strip())
+        except Exception as e:
+            logger.debug("Mistral OCR key sync: %s", e)
+
         try:
             from indexing.text_indexer import load_existing_index
             self.search_index = load_existing_index()
@@ -80,11 +90,41 @@ class RAGService:
         except Exception:
             return []
 
-    def _merge_tree_and_rag(self, query: str, results: list[dict]) -> list[dict]:
+    def _direct_pdf_scan(self, query: str, top_k: int = 5, file_filter: str | None = None) -> list[tuple[str, int, str]]:
+        """Fallback: scan PDFs directly with fitz when tree may miss exact matches.
+        Returns [(file_name, page_number, page_text), ...] for pages containing the exact phrase."""
+        out = []
+        q = (query or "").strip().lower()
+        if len(q) < 10:
+            return out
+        for root, _dirs, files in os.walk(self.data_folder):
+            for name in sorted(files):
+                if not name.lower().endswith(".pdf"):
+                    continue
+                if file_filter and name != file_filter:
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    import fitz
+                    doc = fitz.open(path)
+                    for pg_idx in range(len(doc)):
+                        text = doc.load_page(pg_idx).get_text()
+                        if q in text.lower():
+                            out.append((name, pg_idx + 1, text[:2000]))
+                            if len(out) >= top_k:
+                                doc.close()
+                                return out
+                    doc.close()
+                except Exception as e:
+                    logger.debug("Direct PDF scan failed for %s: %s", name, e)
+        return out
+
+    def _merge_tree_and_rag(self, query: str, results: list[dict], file_filter: str | None = None) -> list[dict]:
         """Unified merge: tree method and agentic RAG reinforce each other.
 
         - Results found by BOTH methods get a corroboration boost
         - Tree-only PDF hits not in fusion get injected
+        - Direct PDF scan fallback when tree misses exact phrase
         - Keyword relevance is scored dynamically from the query
         """
         import re
@@ -92,9 +132,29 @@ class RAGService:
         try:
             from indexing.page_tree import tree_keyword_retrieve
         except ImportError:
-            return results
+            pass
 
-        tree_hits = tree_keyword_retrieve(query, self.page_trees, self.data_folder, top_k=10)
+        tree_hits = []
+        if self.page_trees:
+            tree_hits = tree_keyword_retrieve(query, self.page_trees, self.data_folder, top_k=20)
+            if file_filter:
+                tree_hits = [(tc, sc) for tc, sc in tree_hits if tc.file_name == file_filter]
+
+        # Fallback: scan PDFs for exact phrase (skip for .md/.txt - they're in text index)
+        q_lower = query.lower().strip()
+        existing_tree_pages = {(tc.file_name, tc.page_number) for tc, _ in tree_hits}
+        if len(q_lower) >= 10 and (not file_filter or (file_filter and file_filter.lower().endswith(".pdf"))):
+            for fname, pg, text in self._direct_pdf_scan(query, top_k=5, file_filter=file_filter):
+                if (fname, pg) not in existing_tree_pages:
+                    from indexing.page_tree import TreeChunk
+                    tc = TreeChunk(
+                        chunk_id=f"direct_pdf_{fname}_{pg}",
+                        text=text,
+                        file_name=fname,
+                        page_number=pg,
+                    )
+                    tc._section_title = ""
+                    tree_hits.append((tc, 1.0))
 
         tree_scores: dict[tuple, float] = {}
         tree_data: dict[tuple, dict] = {}
@@ -106,7 +166,7 @@ class RAGService:
                 "file_name": tc.file_name,
                 "page": tc.page_number,
                 "score": 0.0,
-                "snippet": (tc.text or "")[:500],
+                "snippet": (tc.text or "")[:2000],
                 "patient_name": getattr(tc, "patient_name", "") or "",
                 "section_title": getattr(tc, "_section_title", "") or "",
             }
@@ -128,8 +188,12 @@ class RAGService:
                 base += 0.15 * tree_sc
 
             if q_words:
+                # Strong boost for exact query phrase (e.g. "Concentration of Funding Sources")
                 if q_lower in text:
-                    base += 0.4
+                    base += 0.6
+                # Bonus when query matches section heading exactly
+                elif title and len(q_lower) >= 10 and q_lower in title:
+                    base += 0.5
                 matched = sum(1 for w in q_words if w in text)
                 base += (matched / len(q_words)) * 0.25
 
@@ -151,7 +215,7 @@ class RAGService:
         results.sort(key=lambda x: x["score"], reverse=True)
         return results
 
-    def chat(self, query: str, patient_filter: str | None = None, web_search: bool = False) -> dict:
+    def chat(self, query: str, patient_filter: str | None = None, web_search: bool = False, file_filter: str | None = None) -> dict:
         """Run the full search pipeline and return structured results."""
         from retrieval.agentic_rag import run_agentic_rag, get_robust_catalog
         from retrieval.text_retriever import TextRetriever
@@ -169,6 +233,8 @@ class RAGService:
         if patient_filter and patient_filter != "All":
             aliases = catalog.get("patient_name_aliases", {})
             user_meta["patient_name"] = aliases.get(patient_filter, [patient_filter])
+        if file_filter:
+            user_meta["file_name"] = file_filter
 
         llm_key, provider = self._llm_key_and_provider()
 
@@ -188,16 +254,14 @@ class RAGService:
 
         summary = ""
         sources: list[dict] = []
-        if fused:
-            try:
-                summary, sources = generate_summary_from_results(query, fused, llm_key, provider)
-            except Exception as e:
-                logger.warning("Summary generation failed: %s", e)
-                if direct_answer:
-                    summary = direct_answer
-
         results = []
-        for r in (fused or [])[:15]:
+        for r in (fused or [])[:25]:
+            # When Chat clicked on a specific doc, only keep results from that file
+            if file_filter:
+                c = r.get("content")
+                fn = getattr(c, "file_name", "") if hasattr(c, "file_name") else (c or {}).get("file_name", "")
+                if fn != file_filter:
+                    continue
             content = r["content"]
             if r["type"] == "text":
                 results.append({
@@ -205,7 +269,7 @@ class RAGService:
                     "file_name": getattr(content, "file_name", ""),
                     "page": getattr(content, "page_number", None),
                     "score": r.get("final_score", 0),
-                    "snippet": (getattr(content, "text", "") or "")[:500],
+                    "snippet": (getattr(content, "text", "") or "")[:2000],
                     "patient_name": getattr(content, "patient_name", "") or "",
                     "section_title": getattr(content, "_section_title", "") or "",
                 })
@@ -224,13 +288,81 @@ class RAGService:
         if self.page_trees:
             results = self._merge_tree_and_rag(query, results)
 
+        # Build score_sources early so we can pass exact-phrase-prioritized items to summary
+        q_lower = (query or "").strip().lower()
+        exact_phrase_sources: list[dict] = []
+        other_sources: list[dict] = []
+        seen_src: set[tuple] = set()
+        for r in results:
+            fn = r.get("file_name", "")
+            pg = r.get("page")
+            key = (fn, pg)
+            if not fn or key in seen_src:
+                continue
+            src = {"file_name": fn, "page": pg, "title": fn}
+            if r.get("type") == "web" and r.get("url"):
+                src["url"] = r["url"]
+            seen_src.add(key)
+            snippet = (r.get("snippet", "") or "").lower()
+            if len(q_lower) >= 10 and q_lower in snippet and fn.lower().endswith(".pdf"):
+                exact_phrase_sources.append(src)
+            else:
+                other_sources.append(src)
+        score_sources = exact_phrase_sources + other_sources
+        if len(score_sources) > 8:
+            score_sources = score_sources[:8]
+
+        # Build fused_map: (file_name, page) -> fused item for LLM; use score_sources order so PDF pages with exact match appear first
+        fused_map: dict[tuple, dict] = {}
+        for r in (fused or []):
+            c = r.get("content")
+            if r.get("type") == "text" and hasattr(c, "file_name"):
+                key = (getattr(c, "file_name", ""), getattr(c, "page_number", None))
+                if key not in fused_map or (r.get("final_score", 0) > fused_map[key].get("final_score", 0)):
+                    fused_map[key] = r
+            elif r.get("type") == "image" and isinstance(c, dict):
+                key = (c.get("file_name", ""), c.get("page"))
+                if key not in fused_map:
+                    fused_map[key] = r
+
+        # Ordered fused items for summary: score_sources order (PDF exact phrase first) so citations match display
+        ordered_fused: list[dict] = []
+        for src in score_sources:
+            key = (src["file_name"], src.get("page"))
+            if key in fused_map:
+                ordered_fused.append(fused_map[key])
+            else:
+                # Tree-only result: build synthetic fused item from results
+                res = next((x for x in results if (x.get("file_name"), x.get("page")) == key), None)
+                if res:
+                    from types import SimpleNamespace
+                    ordered_fused.append({
+                        "type": "text",
+                        "content": SimpleNamespace(
+                            file_name=res.get("file_name", ""),
+                            page_number=res.get("page"),
+                            text=res.get("snippet", ""),
+                            _section_title=res.get("section_title", ""),
+                        ),
+                        "final_score": res.get("score", 0),
+                    })
+
+        if ordered_fused:
+            try:
+                summary, sources = generate_summary_from_results(query, ordered_fused, llm_key, provider)
+            except Exception as e:
+                logger.warning("Summary generation failed: %s", e)
+                if direct_answer:
+                    summary = direct_answer
+
+        web_results: list[dict] = []
         if web_search:
             try:
                 from backend.services.web_search import web_search as do_web_search
                 web_hits = do_web_search(query, max_results=5)
                 web_context = ""
                 for i, wh in enumerate(web_hits):
-                    results.append({
+                    web_results.append({
                         "type": "web",
                         "file_name": wh.get("source", "") or wh.get("title", "Web"),
                         "page": None,
@@ -241,6 +373,10 @@ class RAGService:
                         "url": wh.get("url", ""),
                     })
                     web_context += f"\n[Web: {wh.get('title', '')}] {wh.get('snippet', '')}"
+
+                # Prepend web results so they appear in sources chips and retrieved list
+                if web_results:
+                    results = web_results + results
 
                 if web_context and summary:
                     llm_key, prov = self._llm_key_and_provider()
@@ -266,19 +402,7 @@ class RAGService:
         if direct_answer and not summary:
             summary = direct_answer
 
-        score_sources: list[dict] = []
-        seen_src: set[tuple] = set()
-        for r in results:
-            fn = r.get("file_name", "")
-            pg = r.get("page")
-            key = (fn, pg)
-            if fn and key not in seen_src:
-                score_sources.append({"file_name": fn, "page": pg, "title": fn})
-                seen_src.add(key)
-            if len(score_sources) >= 8:
-                break
-
-        if score_sources:
+        if not sources and score_sources:
             sources = score_sources
 
         return {
@@ -289,32 +413,50 @@ class RAGService:
             "reasoning": (understanding or {}).get("reasoning", ""),
         }
 
+    def _set_progress(self, percent: int, stage: str):
+        self._index_progress = min(100, max(0, percent))
+        self._index_stage = stage
+
     def reindex_docs(self):
         """Re-index documents: text chunks + tree indexes."""
         if self._indexing:
             return
         self._indexing = True
         self._index_status = "indexing_docs"
+        self._index_progress = 0
+        self._index_stage = "Starting..."
         try:
             from indexing.text_indexer import build_text_index
             from indexing.page_tree import build_trees_for_folder
 
             llm_key, provider = self._llm_key_and_provider()
 
+            self._set_progress(5, "Loading existing index...")
+
+            def on_progress(pct: int, stage: str):
+                self._set_progress(pct, stage)
+
             self.search_index = build_text_index(
                 self.data_folder,
                 enable_vision=True,
                 vision_provider=provider,
                 vision_api_key=llm_key,
+                progress_callback=on_progress,
             )
 
-            trees, _n = build_trees_for_folder(self.data_folder, "both", llm_key, provider)
+            self._set_progress(70, "Building trees...")
+            trees, _n = build_trees_for_folder(
+                self.data_folder, "both", llm_key, provider,
+                progress_callback=on_progress,
+            )
             self.page_trees = trees
 
+            self._set_progress(100, "Done")
             self._index_status = "done"
         except Exception as e:
             logger.error("Reindex docs failed: %s", e)
             self._index_status = f"error: {e}"
+            self._index_stage = str(e)
         finally:
             self._indexing = False
 
@@ -324,16 +466,23 @@ class RAGService:
             return
         self._indexing = True
         self._index_status = "indexing_images"
+        self._index_progress = 0
+        self._index_stage = "Starting..."
         try:
             from indexing.image_indexer import build_image_index, get_image_index_count
 
-            build_image_index(self.data_folder)
+            def on_progress(pct: int, stage: str):
+                self._set_progress(pct, stage)
+
+            build_image_index(self.data_folder, progress_callback=on_progress)
             self.image_count = get_image_index_count()
 
+            self._set_progress(100, "Done")
             self._index_status = "done"
         except Exception as e:
             logger.error("Reindex images failed: %s", e)
             self._index_status = f"error: {e}"
+            self._index_stage = str(e)
         finally:
             self._indexing = False
 
@@ -379,6 +528,8 @@ class RAGService:
             "patients": self.get_patients(),
             "status": self._index_status,
             "indexing": self._indexing,
+            "progress": self._index_progress,
+            "stage": self._index_stage,
         }
 
 

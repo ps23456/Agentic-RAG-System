@@ -1,0 +1,11 @@
+{
+  "queries": [
+    {
+      "query": "Brief Profile of Directors appointed during the Financial Year"
+    },
+    {
+      "query": "What is the remuneration of directors?",
+      "file_filter": null
+    }
+  ]
+}

@@ -8,8 +8,8 @@ import { ChatInput } from "./ChatInput";
 interface Props {
   conversation: Conversation | null;
   loading: boolean;
-  onSend: (query: string, webSearch?: boolean) => void;
-  onSourceClick: (source: Source) => void;
+  onSend: (query: string, webSearch?: boolean, fileFilter?: string, evaluateRag?: boolean) => void;
+  onSourceClick: (source: Source, query?: string) => void;
 }
 
 function getDesc(f: UploadedFile): string {
@@ -72,7 +72,7 @@ export function ChatPanel({ conversation, loading, onSend, onSourceClick }: Prop
               {docs.slice(0, 4).map((doc) => (
                 <button
                   key={doc.name}
-                  onClick={() => onSend(`Tell me about ${doc.name}`, false)}
+                  onClick={() => onSend(`Tell me about ${doc.name}`, false, doc.name, false)}
                   className="group flex items-center gap-3.5 p-4 bg-[var(--bg-primary)] border border-[var(--border)] rounded-2xl hover:border-[var(--accent)] hover:shadow-md transition-all text-left"
                 >
                   <div className="w-10 h-10 rounded-xl bg-[var(--bg-secondary)] group-hover:bg-[var(--accent-bg)] flex items-center justify-center shrink-0 transition-colors">
@@ -100,15 +100,37 @@ export function ChatPanel({ conversation, loading, onSend, onSourceClick }: Prop
             </div>
           </div>
 
-          <ChatInput onSend={onSend} disabled={loading} onUploadClick={handleUpload} />
+          <ChatInput
+            onSend={(q, ws, er) => onSend(q, ws, undefined, er)}
+            disabled={loading}
+            onUploadClick={handleUpload}
+          />
         </>
       ) : (
         <>
+          {conversation.scopedFile && (
+            <div className="shrink-0 px-6 py-2.5 border-b border-[var(--border)] bg-[var(--bg-secondary)]/60">
+              <p className="max-w-3xl mx-auto text-[12px] text-[var(--text-muted)]">
+                <span className="font-medium text-[var(--text-secondary)]">Scoped to one file:</span>{" "}
+                {conversation.scopedFile}
+                <span className="text-[var(--text-muted)]"> — follow-up questions use this file only. Start a new chat to search all documents.</span>
+              </p>
+            </div>
+          )}
           <div className="flex-1 overflow-y-auto px-6 pb-4">
             <div className="max-w-3xl mx-auto">
               <div className="h-14" />
-              {conversation.messages.map((m) => (
-                <ChatMessage key={m.id} message={m} onSourceClick={onSourceClick} />
+              {conversation.messages.map((m, i) => (
+                <ChatMessage
+                  key={m.id}
+                  message={m}
+                  query={
+                    m.role === "assistant"
+                      ? m.query ?? (conversation.messages[i - 1]?.role === "user" ? conversation.messages[i - 1].content : undefined)
+                      : undefined
+                  }
+                  onSourceClick={onSourceClick}
+                />
               ))}
               {loading && (
                 <div className="flex gap-3.5 mb-6 anim-fade-up">
@@ -131,7 +153,11 @@ export function ChatPanel({ conversation, loading, onSend, onSourceClick }: Prop
               <div ref={bottomRef} />
             </div>
           </div>
-          <ChatInput onSend={onSend} disabled={loading} onUploadClick={handleUpload} />
+          <ChatInput
+            onSend={(q, ws, er) => onSend(q, ws, undefined, er)}
+            disabled={loading}
+            onUploadClick={handleUpload}
+          />
         </>
       )}
     </div>

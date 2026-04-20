@@ -5,6 +5,14 @@ import { generateId } from "../lib/utils";
 
 const STORAGE_KEY = "ics_conversations";
 
+/** Match a document filename in natural language (aligned with backend agentic_rag _FILENAME_PATTERN). */
+function inferScopedFileFromQuery(query: string): string | undefined {
+  const m = query.match(
+    /\b([A-Za-z0-9_\-]+(?:\s*\(\d+\))?\.(?:png|jpg|jpeg|gif|bmp|tiff|tif|pdf|webp|md|txt|json))\b/i
+  );
+  return m ? m[1] : undefined;
+}
+
 function loadConversations(): Conversation[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -39,6 +47,7 @@ export function useChat() {
       title: "New Chat",
       messages: [],
       createdAt: Date.now(),
+      scopedFile: undefined,
     };
     const updated = [conv, ...conversations];
     persist(updated);
@@ -47,7 +56,7 @@ export function useChat() {
   }, [conversations, persist]);
 
   const send = useCallback(
-    async (query: string, onSource?: (sources: Source[]) => void, webSearch?: boolean) => {
+    async (query: string, onSource?: (sources: Source[]) => void, webSearch?: boolean, patientFilter?: string, fileFilter?: string, evaluateRag?: boolean) => {
       let convId = activeId;
       let convos = [...conversations];
 
@@ -57,11 +66,15 @@ export function useChat() {
           title: query.slice(0, 40),
           messages: [],
           createdAt: Date.now(),
+          scopedFile: fileFilter || undefined,
         };
         convos = [conv, ...convos];
         convId = conv.id;
         setActiveId(convId);
       }
+
+      const activeConv = convos.find((c) => c.id === convId);
+      const effectiveFile = (fileFilter && fileFilter.trim()) || activeConv?.scopedFile || undefined;
 
       const userMsg: ChatMessage = {
         id: generateId(),
@@ -72,7 +85,12 @@ export function useChat() {
 
       convos = convos.map((c) =>
         c.id === convId
-          ? { ...c, messages: [...c.messages, userMsg], title: c.messages.length === 0 ? query.slice(0, 40) : c.title }
+          ? {
+              ...c,
+              messages: [...c.messages, userMsg],
+              title: c.messages.length === 0 ? query.slice(0, 40) : c.title,
+              scopedFile: (effectiveFile || c.scopedFile) ?? undefined,
+            }
           : c
       );
       persist(convos);
@@ -80,7 +98,7 @@ export function useChat() {
 
       try {
         const t0 = Date.now();
-        const resp = await sendChat(query, undefined, webSearch);
+        const resp = await sendChat(query, patientFilter, webSearch, effectiveFile, evaluateRag);
         const elapsed = Math.round((Date.now() - t0) / 1000);
 
         const assistantMsg: ChatMessage = {
@@ -93,6 +111,11 @@ export function useChat() {
           reasoning: resp.reasoning,
           thinkingTime: elapsed,
           timestamp: Date.now(),
+          query,
+          evaluation: resp.evaluation ?? undefined,
+          evaluation_error: resp.evaluation_error ?? undefined,
+          evaluation_notes: resp.evaluation_notes ?? undefined,
+          ragasRequested: Boolean(evaluateRag),
         };
 
         convos = convos.map((c) =>

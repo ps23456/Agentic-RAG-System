@@ -32,6 +32,10 @@ def get_doc_type(filename: str) -> str:
         return DOC_TYPE_MEDICAL
     return DOC_TYPE_UNKNOWN
 
+# Mistral OCR: comma-separated PDF basenames to always OCR via Mistral (e.g. handwritten forms with embedded template text).
+# Example: MISTRAL_OCR_FORCE_FILENAMES="TEE_TBrown (1).pdf,scan.pdf"
+MISTRAL_OCR_FORCE_FILENAMES = os.environ.get("MISTRAL_OCR_FORCE_FILENAMES", "")
+
 # Chunking
 CHUNK_BY = "paragraph"  # or "page"
 MAX_CHUNK_CHARS = 1500

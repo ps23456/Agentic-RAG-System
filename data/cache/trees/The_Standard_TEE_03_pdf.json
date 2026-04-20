@@ -1,0 +1,53 @@
+{
+  "file_name": "The_Standard_TEE_03.pdf",
+  "file_path": "/Users/pshah/testing 3/data/uploads/The_Standard_TEE_03.pdf",
+  "nodes": [
+    {
+      "title": "Education",
+      "node_id": "0000",
+      "start_index": 1,
+      "end_index": 1,
+      "summary": "Education",
+      "nodes": [
+        {
+          "title": "Educational Level",
+          "node_id": "0001",
+          "start_index": 1,
+          "end_index": 1,
+          "summary": "Educational Level"
+        },
+        {
+          "title": "Training",
+          "node_id": "0002",
+          "start_index": 1,
+          "end_index": 1,
+          "summary": "Training"
+        }
+      ]
+    },
+    {
+      "title": "Computer/Technology Skills",
+      "node_id": "0003",
+      "start_index": 2,
+      "end_index": 2,
+      "summary": "Computer/Technology Skills",
+      "nodes": [
+        {
+          "title": "Computer Knowledge",
+          "node_id": "0004",
+          "start_index": 2,
+          "end_index": 2,
+          "summary": "Computer Knowledge"
+        }
+      ]
+    },
+    {
+      "title": "General Experience",
+      "node_id": "0005",
+      "start_index": 2,
+      "end_index": 2,
+      "summary": "General Experience"
+    }
+  ],
+  "page_count": 2
+}

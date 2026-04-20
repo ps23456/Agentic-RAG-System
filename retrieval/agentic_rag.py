@@ -19,6 +19,65 @@ from document_loader import extract_chunk_metadata
 # OCR often misreads names: "Rita Pepper" -> "Rika Popper", "Rita Peyer". Merge similar names.
 _PATIENT_NAME_SIMILARITY_THRESHOLD = 0.82
 
+# Detect filenames in queries so we can filter retrieval to that file (Chroma metadata file_name).
+# Supports uploads like "TEE_TBrown (1).pdf" — older pattern only matched [\w-]+ before the dot.
+_FILENAME_PATTERN = re.compile(
+    r"\b([A-Za-z0-9_\-]+(?:\s*\(\d+\))?\.(?:png|jpg|jpeg|gif|bmp|tiff|tif|pdf|webp|md|txt|json))\b",
+    re.IGNORECASE,
+)
+
+# Paths like data/uploads/TEE_TBrown (1).md — same basename rules as _FILENAME_PATTERN after a slash
+_PATH_AFTER_SLASH = re.compile(
+    r"[/\\]([A-Za-z0-9_\-]+(?:\s*\(\d+\))?\.(?:png|jpg|jpeg|gif|bmp|tiff|tif|pdf|webp|md|txt|json))\b",
+    re.IGNORECASE,
+)
+# @data/uploads/TEE_TBrown (1).md — allow spaces in path before extension
+_AT_PATH_FILE = re.compile(
+    r"@([^@\n]+\.(?:png|jpg|jpeg|gif|bmp|tiff|tif|pdf|webp|md|txt|json))\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_query_filename(query: str) -> Optional[str]:
+    """
+    Infer which uploaded file (Chroma file_name) the user refers to.
+    Collects all plausible filenames, normalizes to basename, picks the most specific
+    (longest basename wins — avoids first-match bugs like report.md vs TEE_TBrown (1).md).
+    """
+    if not (query and query.strip()):
+        return None
+    cands: list[str] = []
+
+    for m in _FILENAME_PATTERN.finditer(query):
+        cands.append(m.group(1).strip())
+
+    for m in _PATH_AFTER_SLASH.finditer(query):
+        cands.append(m.group(1).strip())
+
+    for m in _AT_PATH_FILE.finditer(query):
+        cands.append(os.path.basename(m.group(1).strip()))
+
+    seen_lower: set[str] = set()
+    uniq: list[str] = []
+    for c in cands:
+        base = os.path.basename(c.strip().strip('"').strip("'"))
+        if not base or base.lower() in seen_lower:
+            continue
+        seen_lower.add(base.lower())
+        uniq.append(base)
+
+    if not uniq:
+        return None
+
+    def score(name: str) -> tuple:
+        pos = query.lower().rfind(name.lower())
+        if pos < 0:
+            pos = 0
+        return (len(name), pos)
+
+    return max(uniq, key=score)
+
+
 # ──────────────────────────────────────────────────────────────
 # Catalog & metadata helpers
 # ──────────────────────────────────────────────────────────────
@@ -311,6 +370,7 @@ OUTPUT FORMAT (valid JSON only, no markdown):
 }}
 
 CRITICAL RULES:
+- If the query mentions a specific file (e.g. flower.png, report.pdf), ALWAYS include the exact filename in search_queries.
 - ONLY set patient_filter if the patient's name is EXPLICITLY MENTIONED in the query.
 - If the query is general (e.g., "diagrams", "arrows", "forms"), do NOT apply any patient filters.
 - Use words that appear in the documents (PHYSICAL CAPACITIES, icd10, ICD-9, treatment, stand, walk, hours, etc.) for text queries.
@@ -324,8 +384,23 @@ CRITICAL RULES:
 - NEVER refuse or say you can't help."""
 
 
+def _is_groq_limit_error(e: Exception) -> bool:
+    """True if error is Groq rate limit / quota exceeded."""
+    msg = str(e).lower()
+    if "rate" in msg and "limit" in msg:
+        return True
+    if "429" in msg or "quota" in msg or "limit exceeded" in msg:
+        return True
+    try:
+        from groq import RateLimitError
+        return isinstance(e, RateLimitError)
+    except ImportError:
+        pass
+    return getattr(e, "status_code", None) == 429
+
+
 def _call_llm(prompt: str, api_key: str, provider: str) -> str | None:
-    """Call the LLM and return raw text response."""
+    """Call the LLM and return raw text response. Falls back to OpenAI when Groq limit exceeded."""
     try:
         if provider == "groq":
             from groq import Groq
@@ -359,7 +434,23 @@ def _call_llm(prompt: str, api_key: str, provider: str) -> str | None:
                 temperature=0.1,
             )
             return r.choices[0].message.content if r.choices else None
-    except Exception:
+    except Exception as e:
+        # When Groq rate limit exceeded, fallback to OpenAI if available
+        if provider == "groq" and _is_groq_limit_error(e):
+            openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+            if openai_key:
+                try:
+                    from openai import OpenAI
+                    client = OpenAI(api_key=openai_key)
+                    r = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=600,
+                        temperature=0.1,
+                    )
+                    return r.choices[0].message.content if r.choices else None
+                except Exception:
+                    pass
         return None
     return None
 
@@ -383,10 +474,11 @@ def _resolve_api_key(llm_api_key: str) -> str:
     key = (llm_api_key or "").strip()
     if key:
         return key
-    for env in ["GROQ_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_KEY"]:
+    # Groq first, then OpenAI as fallback, then Gemini
+    for env in ["GROQ_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"]:
         k = os.environ.get(env)
-        if k:
-            return k.strip()
+        if k and str(k).strip():
+            return str(k).strip()
     return ""
 
 
@@ -398,13 +490,14 @@ def _resolve_provider(llm_provider: str) -> str:
         return "gemini"
     if "openai" in p or "chatgpt" in p:
         return "openai"
-    if os.environ.get("GROQ_API_KEY"):
+    # Prefer Groq if key exists, else fallback to OpenAI, then Gemini
+    if os.environ.get("GROQ_API_KEY") and str(os.environ.get("GROQ_API_KEY", "")).strip():
         return "groq"
+    if os.environ.get("OPENAI_API_KEY") and str(os.environ.get("OPENAI_API_KEY", "")).strip():
+        return "openai"
     if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
         return "gemini"
-    if os.environ.get("OPENAI_API_KEY"):
-        return "openai"
-    return "groq"
+    return "openai"  # default fallback when no keys
 
 
 # ──────────────────────────────────────────────────────────────
@@ -764,8 +857,15 @@ def run_agentic_rag(
     main_phrases = main_intent_keywords if main_intent_keywords else None
     filter_phrases = [patient_filter] if patient_filter else None
 
+    # When query mentions a specific file (e.g. "@data/uploads/foo.md"), filter retrieval to that basename
+    query_filename = _extract_query_filename(query)
+    if query_filename and query_filename not in search_queries:
+        search_queries = [query_filename] + list(search_queries)
+
     # Build metadata filter (expand patient to OCR variants for matching)
     metadata_filter = {}
+    if query_filename:
+        metadata_filter["file_name"] = query_filename
     if patient_filter:
         aliases = (catalog_final or {}).get("patient_name_aliases", {})
         metadata_filter["patient_name"] = aliases.get(patient_filter, [patient_filter])
@@ -789,6 +889,14 @@ def run_agentic_rag(
     }
 
     retrieve_k = METADATA_DIVERSITY_CANDIDATES if METADATA_DIVERSITY_ENABLED else MULTIMODAL_HYBRID_TOP_K
+
+    # Active patient filter can be str or list (aliases); normalize once.
+    patient_vals = (metadata_filter or {}).get("patient_name") or []
+    active_patients = {
+        str(p).strip().lower()
+        for p in (patient_vals if isinstance(patient_vals, (list, tuple)) else [patient_vals])
+        if p
+    }
 
     # Step 3: Execute the plan
     aliases = catalog_final.get("patient_name_aliases", {})
@@ -822,11 +930,90 @@ def run_agentic_rag(
             main_intent_keywords=main_intent_keywords,
         )
 
+        # If patient metadata filtering returns context that is semantically off-topic
+        # (common when one file has missing patient metadata), do a guarded semantic
+        # backoff: retrieve without patient filter and keep only query-overlap chunks.
+        if active_patients and text_results:
+            q_tokens = [w for w in re.findall(r"[a-z0-9]+", (query or "").lower()) if len(w) >= 4]
+            q_token_set = set(q_tokens)
+
+            def _overlap_hits(triples: list[tuple]) -> int:
+                n = 0
+                for c, _ in triples[:12]:
+                    t = (getattr(c, "text", "") or "").lower()
+                    overlap = sum(1 for tok in q_token_set if tok in t)
+                    if overlap >= 2:
+                        n += 1
+                return n
+
+            q_phrase = (query or "").strip().lower()
+
+            def _has_phrase(triples: list[tuple]) -> bool:
+                if len(q_phrase) < 10:
+                    return False
+                for c, _ in triples[:12]:
+                    t = (getattr(c, "text", "") or "").lower()
+                    if q_phrase in t:
+                        return True
+                return False
+
+            # Very low lexical overlap OR no phrase hit means filtered hits are likely wrong section/file.
+            if q_token_set and (_overlap_hits(text_results) <= 1 or not _has_phrase(text_results)):
+                mf_backoff = dict(metadata_filter or {})
+                mf_backoff.pop("patient_name", None)
+                backoff_text, _ = _multi_query_retrieve(
+                    search_queries,
+                    text_retriever,
+                    image_retriever,
+                    index,
+                    metadata_filter=mf_backoff or None,
+                    retrieve_k=retrieve_k,
+                    boost_ocr=(query_type == "text_heavy"),
+                    main_intent_keywords=main_intent_keywords,
+                )
+                seen_ids = {c.chunk_id for c, _ in text_results}
+                for c, s in backoff_text:
+                    t = (getattr(c, "text", "") or "").lower()
+                    overlap = sum(1 for tok in q_token_set if tok in t)
+                    has_phrase = len(q_phrase) >= 10 and q_phrase in t
+                    if overlap < 2 and not has_phrase:
+                        continue
+                    if c.chunk_id in seen_ids:
+                        continue
+                    # Slight boost: content overlap rescue should be visible to fusion.
+                    text_results.append((c, max(s, 1.2 if has_phrase else 0.95)))
+                    seen_ids.add(c.chunk_id)
+
         if page_trees:
             from indexing.page_tree import tree_keyword_retrieve
-            tree_hits = tree_keyword_retrieve(query, page_trees, data_folder)
-            seen_tree = {c.chunk_id for c, _ in text_results}
+            tree_hits = tree_keyword_retrieve(query, page_trees, data_folder, top_k=25)
+            # When Chat clicked on a specific doc, restrict to that file only
+            target_file = (metadata_filter or {}).get("file_name")
+            if target_file:
+                tree_hits = [(tc, sc) for tc, sc in tree_hits if tc.file_name == target_file]
+            elif active_patients and index and getattr(index, "chunks", None):
+                # Tree hits have no patient metadata; restrict by files known to belong
+                # to the active patient(s) to avoid cross-document leakage.
+                allowed_files = {
+                    getattr(c, "file_name", "")
+                    for c in index.chunks
+                    if (getattr(c, "patient_name", "") or "").strip().lower() in active_patients
+                }
+                if allowed_files:
+                    tree_hits = [(tc, sc) for tc, sc in tree_hits if tc.file_name in allowed_files]
+            q_lower = (query or "").strip().lower()
+            # Prioritize tree hits with EXACT phrase match (e.g. "Concentration of Funding Sources")
+            # so PDF page 381 ranks above irrelevant pages 384, 107, etc.
+            exact_tree = []
+            other_tree = []
             for tc, sc in tree_hits:
+                text = (getattr(tc, "text", "") or "").lower()
+                if len(q_lower) >= 10 and q_lower in text:
+                    exact_tree.append((tc, max(sc, 1.0)))  # Boost exact matches
+                else:
+                    other_tree.append((tc, sc))
+            seen_tree = {c.chunk_id for c, _ in text_results}
+            for tc, sc in exact_tree + other_tree:
                 if tc.chunk_id not in seen_tree:
                     text_results.append((tc, sc))
                     seen_tree.add(tc.chunk_id)
@@ -843,7 +1030,10 @@ def run_agentic_rag(
                         if c.chunk_id not in {x.chunk_id for x, _ in verbatim}:
                             verbatim.append((c, s))
         seen_ids = {c.chunk_id for c, _ in verbatim}
-        text_results = list(verbatim) + [(c, s) for c, s in text_results if c.chunk_id not in seen_ids]
+        # Prepend exact-phrase tree hits FIRST so they get best RRF (PDF page 381 outranks .md)
+        exact_tree_front = [(c, s) for c, s in text_results if c.chunk_id not in seen_ids and getattr(c, "chunk_id", "").startswith("tree_kw_") and len(q_lower) >= 10 and q_lower in (getattr(c, "text", "") or "").lower()]
+        seen_ids.update(c.chunk_id for c, _ in exact_tree_front)
+        text_results = exact_tree_front + list(verbatim) + [(c, s) for c, s in text_results if c.chunk_id not in seen_ids]
         main_phrases = main_intent_keywords if main_intent_keywords else None
         filter_phrases = [patient_filter] if patient_filter else None
         text_results = boost_phrase_matching(text_results, query, main_phrases_override=main_phrases, filter_phrases_override=filter_phrases)
@@ -874,15 +1064,15 @@ def run_agentic_rag(
 
         fallback_text, fallback_image = _multi_query_retrieve(
             [query] + search_queries[:1], text_retriever, image_retriever, index,
-            metadata_filter=None, retrieve_k=retrieve_k,
+            metadata_filter=metadata_filter or None, retrieve_k=retrieve_k,
             boost_ocr=(query_type == "text_heavy"),
             main_intent_keywords=main_intent_keywords,
         )
         if index and hasattr(index, "verbatim_search"):
-            v_fb = index.verbatim_search(query, None, max_results=10)
+            v_fb = index.verbatim_search(query, metadata_filter or None, max_results=10)
             for kw in (main_intent_keywords or [])[:3]:
                 if kw and len(kw) >= 8:
-                    v_kw = index.verbatim_search(kw, None, max_results=5)
+                    v_kw = index.verbatim_search(kw, metadata_filter or None, max_results=5)
                     for c, s in v_kw:
                         if c.chunk_id not in {x.chunk_id for x, _ in v_fb}:
                             v_fb.append((c, s))
@@ -891,7 +1081,9 @@ def run_agentic_rag(
         fallback_text = boost_phrase_matching(fallback_text, query, main_phrases_override=main_phrases, filter_phrases_override=filter_phrases)
         fallback_fused = fuse_results(fallback_text, fallback_image, query_type, top_k=retrieve_k)
 
-        active_patient = (metadata_filter or {}).get("patient_name", "").lower()
+        # patient_name can be str or list (OCR aliases)
+        pn_val = (metadata_filter or {}).get("patient_name") or []
+        active_patients = {p.lower() for p in (pn_val if isinstance(pn_val, (list, tuple)) else [pn_val]) if p}
 
         for r in fallback_fused:
             c = r["content"]
@@ -901,12 +1093,12 @@ def run_agentic_rag(
 
             # When a specific patient was requested, skip results that clearly
             # belong to a DIFFERENT patient (prevents cross-patient contamination).
-            if active_patient:
+            if active_patients:
                 if r["type"] == "text":
                     result_patient = (getattr(c, "patient_name", "") or "").lower()
                 else:
                     result_patient = (c.get("patient_name", "") or "").lower()
-                if result_patient and result_patient != active_patient:
+                if result_patient and result_patient not in active_patients:
                     continue
 
             fused.append(r)

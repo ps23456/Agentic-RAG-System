@@ -58,7 +58,7 @@ class TextRetriever:
             query,
             hybrid_hits,
             top_k=top_k,
-            prioritize_exact_phrase=False,
+            prioritize_exact_phrase=True,
         )
         return reranked
 

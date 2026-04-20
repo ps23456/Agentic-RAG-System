@@ -7,7 +7,7 @@ import io
 import logging
 import os
 from pathlib import Path
-from typing import List, Any
+from typing import List, Any, Optional, Callable
 
 from config import (
     DATA_FOLDER,
@@ -160,7 +160,11 @@ def _load_clip():
     return _clip_model, _clip_processor
 
 
-def _collect_image_items(data_folder: str, existing_mtimes: dict[str, float] | None = None) -> List[dict]:
+def _collect_image_items(
+    data_folder: str,
+    existing_mtimes: dict[str, float] | None = None,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+) -> List[dict]:
     """
     Collect indexable image items: image files + PDF pages rendered as images.
     Returns list of {"id", "file_name", "page", "path", "pil_image", "file_type", "is_pdf_page"}.
@@ -170,6 +174,7 @@ def _collect_image_items(data_folder: str, existing_mtimes: dict[str, float] | N
 
     items = []
     seen = set()
+    processed = 0
     if not os.path.isdir(data_folder):
         return items
 
@@ -230,6 +235,10 @@ def _collect_image_items(data_folder: str, existing_mtimes: dict[str, float] | N
                             "doctor_name": doc_meta.get("doctor_name", "") or "",
                             "last_modified": mtime,
                         })
+                        processed += 1
+                        if progress_callback:
+                            pct = min(35, 10 + processed * 3)
+                            progress_callback(pct, f"Processing {base}")
                 except Exception as e:
                     logger.warning("Skip image %s: %s", path, e)
 
@@ -287,6 +296,10 @@ def _collect_image_items(data_folder: str, existing_mtimes: dict[str, float] | N
                             "doctor_name": doc_meta.get("doctor_name", "") or "",
                             "last_modified": mtime,
                         })
+                        processed += 1
+                        if progress_callback and processed % 3 == 0:
+                            pct = min(35, 10 + processed * 2)
+                            progress_callback(pct, f"Processing {base} (page {page_num + 1})")
                     doc.close()
                 except Exception as e:
                     logger.warning("Skip PDF %s: %s", path, e)
@@ -304,14 +317,21 @@ def _encode_images(model, processor, images: List[Any]) -> List[List[float]]:
     return outputs.cpu().numpy().tolist()
 
 
-def build_image_index(data_folder: str | None = None) -> int:
+def build_image_index(
+    data_folder: str | None = None,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+) -> int:
     """
     Build the image-only Chroma collection (CLIP image embeddings).
     Does not index text; does not touch claim_chunks.
     Returns number of image items indexed.
     """
     data_folder = data_folder or DATA_FOLDER
+    if progress_callback:
+        progress_callback(2, "Loading CLIP model (first time may take 1-2 min)...")
     model, processor = _load_clip()
+    if progress_callback:
+        progress_callback(5, "Scanning for images...")
 
     try:
         import chromadb
@@ -344,7 +364,11 @@ def build_image_index(data_folder: str | None = None) -> int:
         logger.debug("Could not fetch existing image metadata: %s", e)
 
     # 2. Collect only new/changed items
-    image_items = _collect_image_items(data_folder, existing_mtimes=existing_mtimes)
+    if progress_callback:
+        progress_callback(8, "Collecting images...")
+    image_items = _collect_image_items(
+        data_folder, existing_mtimes=existing_mtimes, progress_callback=progress_callback
+    )
     if image_items:
         from retrieval.agentic_rag import normalize_patient_names_in_items
         existing_patients = []
@@ -359,10 +383,14 @@ def build_image_index(data_folder: str | None = None) -> int:
         normalize_patient_names_in_items(image_items, existing_patient_names=existing_patients)
     if not image_items:
         logger.info("Image index: no image items found in %s", data_folder)
+        if progress_callback:
+            progress_callback(100, "No new images to index")
         return 0
 
     images = [x["pil_image"] for x in image_items]
     embeddings = _encode_images(model, processor, images)
+    if progress_callback:
+        progress_callback(85, "Encoding with CLIP...")
     ids = [x["id"] for x in image_items]
     metadatas = [
         {
@@ -383,7 +411,11 @@ def build_image_index(data_folder: str | None = None) -> int:
         }
         for x in image_items
     ]
+    if progress_callback:
+        progress_callback(95, "Saving to index...")
     collection.upsert(ids=ids, embeddings=embeddings, metadatas=metadatas)
+    if progress_callback:
+        progress_callback(100, "Done")
     logger.info("Image index: added/updated %d item(s) to %s", len(ids), CHROMA_IMAGE_COLLECTION_NAME)
     return len(ids)
 

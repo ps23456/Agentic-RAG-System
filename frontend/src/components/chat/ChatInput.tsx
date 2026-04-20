@@ -2,7 +2,8 @@ import { useState, useRef, useEffect } from "react";
 import { ArrowUp, Plus, Globe } from "lucide-react";
 
 interface Props {
-  onSend: (query: string, webSearch: boolean) => void;
+  /** fileFilter omitted from input — use undefined for normal chat */
+  onSend: (query: string, webSearch: boolean, evaluateRag: boolean) => void;
   disabled?: boolean;
   onUploadClick?: () => void;
 }
@@ -10,6 +11,7 @@ interface Props {
 export function ChatInput({ onSend, disabled, onUploadClick }: Props) {
   const [value, setValue] = useState("");
   const [webSearch, setWebSearch] = useState(false);
+  const [evaluateRag, setEvaluateRag] = useState(false);
   const ref = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => { ref.current?.focus(); }, [disabled]);
@@ -22,7 +24,7 @@ export function ChatInput({ onSend, disabled, onUploadClick }: Props) {
   const submit = () => {
     const q = value.trim();
     if (!q || disabled) return;
-    onSend(q, webSearch);
+    onSend(q, webSearch, evaluateRag);
     setValue("");
   };
 
@@ -63,6 +65,18 @@ export function ChatInput({ onSend, disabled, onUploadClick }: Props) {
               >
                 <Globe size={15} strokeWidth={1.8} />
                 {webSearch && <span>Web</span>}
+              </button>
+              <button
+                type="button"
+                onClick={() => setEvaluateRag(!evaluateRag)}
+                title="Run RAGAs faithfulness + answer relevancy (slower; Groq first, OpenAI fallback)"
+                className={`px-2.5 py-1.5 rounded-xl text-[12px] font-medium transition-all ${
+                  evaluateRag
+                    ? "bg-amber-100 text-amber-900 dark:bg-amber-900/30 dark:text-amber-200"
+                    : "text-[var(--text-muted)] hover:bg-[var(--bg-hover)]"
+                }`}
+              >
+                RAGAs
               </button>
             </div>
             <button

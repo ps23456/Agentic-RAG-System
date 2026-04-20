@@ -16,7 +16,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 from config import DATA_FOLDER, PAGE_TREE_CACHE_DIR, PAGE_TREE_MAX_PAGES_PER_LLM, PAGE_TREE_TOC_PAGES, PAGE_TREE_MAX_PAGES_PER_NODE
 
@@ -40,8 +40,23 @@ class TreeChunk:
     doctor_name: str = ""
 
 
+def _is_groq_limit_error(e: Exception) -> bool:
+    """True if error is Groq rate limit / quota exceeded."""
+    msg = str(e).lower()
+    if "rate" in msg and "limit" in msg:
+        return True
+    if "429" in msg or "quota" in msg or "limit exceeded" in msg:
+        return True
+    try:
+        from groq import RateLimitError
+        return isinstance(e, RateLimitError)
+    except ImportError:
+        pass
+    return getattr(e, "status_code", None) == 429
+
+
 def _call_llm_tree(prompt: str, api_key: str, provider: str, max_tokens: int = 4000) -> str | None:
-    """Call LLM for tree building/search."""
+    """Call LLM for tree building/search. Falls back to OpenAI when Groq limit exceeded."""
     api_key = (api_key or "").strip() or os.environ.get("GROQ_API_KEY") or os.environ.get("OPENAI_API_KEY") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
     if not api_key:
         return None
@@ -90,6 +105,23 @@ def _call_llm_tree(prompt: str, api_key: str, provider: str, max_tokens: int = 4
             )
             return r.choices[0].message.content if r.choices else None
     except Exception as e:
+        # When Groq rate limit exceeded, fallback to OpenAI if available
+        if provider == "groq" and _is_groq_limit_error(e):
+            openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+            if openai_key:
+                logger.info("Groq limit exceeded, falling back to OpenAI")
+                try:
+                    from openai import OpenAI
+                    client = OpenAI(api_key=openai_key)
+                    r = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=max_tokens,
+                        temperature=0.1,
+                    )
+                    return r.choices[0].message.content if r.choices else None
+                except Exception as fallback_err:
+                    logger.warning("OpenAI fallback also failed: %s", fallback_err)
         logger.warning("LLM call for tree failed: %s", e)
     return None
 
@@ -912,20 +944,38 @@ def generate_summary_from_results(
     Handles both text chunks (Chunk/TreeChunk objects) and image results (dicts).
     Returns (summary_markdown, source_citations).
     """
-    top_items = fused_results[:5]
+    top_items = fused_results[:8]
     if not top_items:
         return "", []
 
+    def _normalize_for_summary(text: str) -> str:
+        """
+        Normalize OCR/markdown table noise so the LLM can read form rows reliably.
+        Converts pipe-heavy markdown rows to plain text and trims separator clutter.
+        """
+        if not text:
+            return ""
+        t = text
+        # Collapse markdown table separators (| --- | --- |) which add noise.
+        t = re.sub(r"^\s*\|?\s*(?:-+\s*\|)+\s*-+\s*\|?\s*$", "", t, flags=re.MULTILINE)
+        # Replace remaining table pipes with spaced delimiters.
+        t = t.replace("|", " ; ")
+        # Normalize repeated punctuation/separators from OCR output.
+        t = re.sub(r"[;]{2,}", ";", t)
+        t = re.sub(r"\s{2,}", " ", t)
+        # Keep line structure for section/header detection.
+        t = re.sub(r"\n{3,}", "\n\n", t)
+        return t.strip()
+
     content_parts = []
     sources = []
-    seen_sources = set()
+    seen_sources: dict[tuple, int] = {}  # (fname, pg) -> 1-based index
     for r in top_items:
         content = r["content"]
         if r.get("type") == "image" and isinstance(content, dict):
             fname = content.get("file_name", "")
             pg = content.get("page", "?")
             ocr = content.get("ocr_text", "") or ""
-            # For PDF images, read the actual page text for richer context
             page_text = ""
             if fname and str(pg).isdigit() and fname.lower().endswith(".pdf"):
                 img_path = content.get("path", "")
@@ -939,34 +989,46 @@ def generate_summary_from_results(
                     nearby = _read_pdf_page_range(pdf_path, int(pg), int(pg))
                     page_text = nearby[0][1][:2500] if nearby else ""
             txt = page_text or ocr[:3000] or f"[Image from {fname} page {pg}]"
-            content_parts.append(f"[Source: {fname} p.{pg}]\n{txt}")
+            txt = _normalize_for_summary(txt)
+            src_key = (fname, str(pg))
+            if src_key not in seen_sources:
+                seen_sources[src_key] = len(sources) + 1
+                sources.append({"file_name": fname, "page": pg, "title": fname})
+            idx = seen_sources[src_key]
+            content_parts.append(f"[Source {idx}: {fname} p.{pg}]\n{txt}")
         else:
             fname = getattr(content, "file_name", "") or ""
             pg = getattr(content, "page_number", None) or "?"
             txt = (getattr(content, "text", "") or "")[:3000]
-            content_parts.append(f"[Source: {fname} p.{pg}]\n{txt}")
-        src_key = (fname, str(pg))
-        if src_key not in seen_sources:
-            seen_sources.add(src_key)
-            section = ""
-            if r.get("type") != "image":
+            txt = _normalize_for_summary(txt)
+            src_key = (fname, str(pg))
+            if src_key not in seen_sources:
+                seen_sources[src_key] = len(sources) + 1
                 section = getattr(content, "_section_title", "") or ""
-            sources.append({
-                "file_name": fname,
-                "page": pg,
-                "title": section or fname,
-            })
+                sources.append({
+                    "file_name": fname,
+                    "page": pg,
+                    "title": section or fname,
+                })
+            idx = seen_sources[src_key]
+            content_parts.append(f"[Source {idx}: {fname} p.{pg}]\n{txt}")
 
     summary_input = "\n\n---\n\n".join(content_parts)
     if len(summary_input) > 20000:
         summary_input = summary_input[:20000]
 
+    # Build numbered source list for citation instructions
+    source_nums = "\n".join(f"- [{i+1}] {s['file_name']} (page {s['page']})" for i, s in enumerate(sources))
+
     prompt = f"""Based on the following document excerpts, answer the user's question with a clear, well-structured summary.
 
 Question: "{query}"
 
-Document excerpts:
+Document excerpts (each prefixed with its source number):
 {summary_input}
+
+Source reference (use these numbers for citations):
+{source_nums}
 
 INSTRUCTIONS:
 - Write a clear, structured answer using ONLY information from the excerpts
@@ -974,6 +1036,10 @@ INSTRUCTIONS:
 - Use bullet points for key details
 - Include specific data, numbers, and facts
 - If content is in a non-English language, summarize the key points in English
+- PRIORITIZE excerpts that contain section titles or lines matching the query terms.
+- For OCR/form tables, interpret delimiters (';', '*', broken spacing) and extract concrete values (job title, employer, dates, salary, duties) when present.
+- DO NOT say "not available" or "not provided" if any excerpt contains partial relevant details; report available details and clearly mark unknown fields as "not visible in excerpt".
+- CRITICAL: Add citation markers at the end of sentences or facts that come from a source. Use [1], [2], [3], etc. to match the source numbers above. Example: "Shri D. Surendran holds an MBA [1]." For facts from multiple sources use [1,2]. Add citations so users can verify every claim.
 - Be concise but comprehensive"""
 
     summary = _call_llm_tree(prompt, api_key, provider, max_tokens=2000) or ""
@@ -1376,6 +1442,7 @@ def build_trees_for_folder(
     indexing_mode: str,
     api_key: str = "",
     provider: str = "openai",
+    progress_callback: Optional[Callable[[int, str], None]] = None,
 ) -> tuple[List[dict], int]:
     """
     Build trees for all PDFs in folder when indexing_mode is "tree" or "both".
@@ -1387,23 +1454,46 @@ def build_trees_for_folder(
     if not os.path.isdir(folder):
         return [], 0
 
-    trees = []
-    count = 0
+    # Count PDFs first for progress
+    pdf_paths = []
     for root, _dirs, files in os.walk(folder):
         for name in sorted(files):
-            if not name.lower().endswith(".pdf"):
-                continue
-            path = os.path.join(root, name)
-            try:
-                pages = extract_text_from_pdf(path)
-                if not pages:
+            if name.lower().endswith(".pdf"):
+                pdf_paths.append((root, name))
+
+    trees = []
+    count = 0
+    total = len(pdf_paths)
+    for i, (root, name) in enumerate(pdf_paths):
+        path = os.path.join(root, name)
+        try:
+            pdf_mtime = os.path.getmtime(path)
+            fname_key = name.replace(" ", "_").replace(".", "_")
+            out_json = os.path.join(PAGE_TREE_CACHE_DIR, f"{fname_key}.json")
+            # Skip LLM tree rebuild if cache exists and is newer than the PDF file
+            if os.path.isfile(out_json) and os.path.getmtime(out_json) + 0.5 >= pdf_mtime:
+                cached = load_tree(name)
+                if cached and cached.get("nodes"):
+                    if progress_callback and total > 0:
+                        pct = 70 + int(28 * (i + 1) / total)
+                        progress_callback(pct, f"Tree (cached): {name}")
+                    trees.append(cached)
+                    count += 1
+                    logger.debug("Using cached page tree for %s", name)
                     continue
-                tree = build_tree_from_pdf(path, pages, api_key, provider)
-                save_tree(tree)
-                trees.append(tree)
-                count += 1
-                n_total = _count_nodes(tree.get("nodes", []))
-                logger.info("Built tree for %s: %d total nodes", name, n_total)
-            except Exception as e:
-                logger.warning("Tree build failed for %s: %s", name, e)
+
+            if progress_callback and total > 0:
+                pct = 70 + int(28 * (i + 1) / total)
+                progress_callback(pct, f"Building tree {i + 1}/{total}: {name}")
+            pages = extract_text_from_pdf(path)
+            if not pages:
+                continue
+            tree = build_tree_from_pdf(path, pages, api_key, provider)
+            save_tree(tree)
+            trees.append(tree)
+            count += 1
+            n_total = _count_nodes(tree.get("nodes", []))
+            logger.info("Built tree for %s: %d total nodes", name, n_total)
+        except Exception as e:
+            logger.warning("Tree build failed for %s: %s", name, e)
     return trees, count

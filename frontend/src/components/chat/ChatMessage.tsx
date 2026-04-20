@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import React, { useState, useCallback } from "react";
 import {
   ChevronDown,
   Sparkles,
@@ -9,15 +9,104 @@ import {
   Check,
   Globe,
   ExternalLink,
+  BarChart3,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { ChatMessage as Msg, Source } from "../../lib/types";
+import type { ChatMessage as Msg, ResultItem, Source } from "../../lib/types";
 import { SourceBadge } from "./SourceBadge";
+
+const CITATION_RE = /\[(\d+(?:\s*,\s*\d+)*)\]/g;
+
+function CitationButton({
+  refs,
+  sources,
+  onSourceClick,
+  effectiveQuery,
+}: {
+  refs: number[];
+  sources: Source[];
+  onSourceClick: (source: Source, query?: string) => void;
+  effectiveQuery?: string;
+}) {
+  const n = refs[0];
+  const source = sources[n - 1];
+  if (!source) return <span>[{refs.join(", ")}]</span>;
+  return (
+    <button
+      type="button"
+      onClick={() => onSourceClick(source, effectiveQuery)}
+      className="inline-flex align-baseline mx-0.5 px-1 py-0.5 min-w-[20px] text-[11px] font-semibold rounded bg-[var(--accent-bg)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-white transition-colors cursor-pointer"
+      title={`View source ${n}: ${source.file_name} page ${source.page}`}
+    >
+      [{refs.join(",")}]
+    </button>
+  );
+}
+
+function renderWithCitations(
+  children: React.ReactNode,
+  sources: Source[],
+  onSourceClick: (s: Source, q?: string) => void,
+  effectiveQuery?: string
+): React.ReactNode {
+  if (!sources.length) return children;
+  return React.Children.map(children, (child) => {
+    if (typeof child === "string") {
+      const parts: React.ReactNode[] = [];
+      let lastIndex = 0;
+      let m: RegExpExecArray | null;
+      const re = new RegExp(CITATION_RE.source, "g");
+      while ((m = re.exec(child)) !== null) {
+        parts.push(child.slice(lastIndex, m.index));
+        const refs = m[1].split(/\s*,\s*/).map(Number).filter((n) => n >= 1);
+        if (refs.length) {
+          parts.push(
+            <CitationButton
+              key={`cit-${m.index}`}
+              refs={refs}
+              sources={sources}
+              onSourceClick={onSourceClick}
+              effectiveQuery={effectiveQuery}
+            />
+          );
+        }
+        lastIndex = m.index + m[0].length;
+      }
+      if (parts.length === 0) return child;
+      parts.push(child.slice(lastIndex));
+      return <>{parts}</>;
+    }
+    if (child && typeof child === "object" && "props" in child && (child as React.ReactElement).props.children) {
+      return {
+        ...child,
+        props: {
+          ...(child as React.ReactElement).props,
+          children: renderWithCitations(
+            (child as React.ReactElement).props.children,
+            sources,
+            onSourceClick,
+            effectiveQuery
+          ),
+        },
+      };
+    }
+    return child;
+  });
+}
+
+function buildSearchContext(r: ResultItem): string | undefined {
+  const exact = (r.section_title || "").trim();
+  const similar = (r.snippet || "").slice(0, 120).replace(/\s*\.{2,}\s*$/, "").trim();
+  if (exact && exact.length >= 8 && exact.length <= 120 && similar) {
+    return `${exact}\n${similar}`;
+  }
+  return similar || undefined;
+}
 
 interface Props {
   message: Msg;
-  onSourceClick: (source: Source) => void;
+  onSourceClick: (source: Source, query?: string) => void;
 }
 
 function CopyButton({ text }: { text: string }) {
@@ -38,7 +127,8 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-export function ChatMessage({ message, onSourceClick }: Props) {
+export function ChatMessage({ message, query: queryProp, onSourceClick }: Props) {
+  const effectiveQuery = message.query ?? queryProp;
   const [showThought, setShowThought] = useState(false);
   const [showChunks, setShowChunks] = useState(false);
 
@@ -99,6 +189,48 @@ export function ChatMessage({ message, onSourceClick }: Props) {
             </div>
           )}
 
+          {/* RAGAs: above the answer so it is not missed below long replies */}
+          {(message.ragasRequested ||
+            (message.evaluation && Object.keys(message.evaluation).length > 0) ||
+            message.evaluation_error ||
+            message.evaluation_notes) && (
+            <div className="mb-4 rounded-xl border border-amber-200/80 bg-amber-50/90 dark:border-amber-800/60 dark:bg-amber-950/40 px-3 py-2.5 text-[12px] text-[var(--text-secondary)]">
+              <div className="flex items-center gap-1.5 font-medium text-amber-900 dark:text-amber-200 mb-1">
+                <BarChart3 size={14} className="text-amber-600 dark:text-amber-400 shrink-0" />
+                RAGAs evaluation
+              </div>
+              {message.evaluation && Object.keys(message.evaluation).length > 0 ? (
+                <div className="flex flex-wrap gap-x-4 gap-y-1">
+                  {Object.entries(message.evaluation).map(([k, v]) => (
+                    <span key={k}>
+                      <span className="text-[var(--text-muted)]">{k.replace(/_/g, " ")}:</span>{" "}
+                      <span className="font-mono text-[var(--text-primary)]">
+                        {typeof v === "number" ? v.toFixed(3) : String(v)}
+                      </span>
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+              {message.evaluation_notes && (
+                <p className="text-[12px] text-[var(--text-muted)] mt-1.5 leading-snug border-t border-amber-200/50 dark:border-amber-800/40 pt-1.5">
+                  {message.evaluation_notes}
+                </p>
+              )}
+              {!(message.evaluation && Object.keys(message.evaluation).length > 0) ? (
+                message.evaluation_error ? (
+                  <p className="text-[13px] text-amber-950/90 dark:text-amber-100/90 leading-snug">
+                    {message.evaluation_error}
+                  </p>
+                ) : message.ragasRequested ? (
+                  <p className="text-[13px] text-[var(--text-muted)]">
+                    No scores in this response. Send the message again with RAGAs on, or hard-refresh the app so the
+                    latest frontend is loaded.
+                  </p>
+                ) : null
+              ) : null}
+            </div>
+          )}
+
           {/* Answer content */}
           <div className="chat-prose text-[15px] text-[var(--text-primary)] leading-[1.75]">
             <ReactMarkdown
@@ -114,6 +246,31 @@ export function ChatMessage({ message, onSourceClick }: Props) {
                     </div>
                   </div>
                 ),
+                p: ({ children, ...props }) => (
+                  <p {...props}>
+                    {hasSources ? renderWithCitations(children, message.sources!, onSourceClick, effectiveQuery) : children}
+                  </p>
+                ),
+                li: ({ children, ...props }) => (
+                  <li {...props}>
+                    {hasSources ? renderWithCitations(children, message.sources!, onSourceClick, effectiveQuery) : children}
+                  </li>
+                ),
+                h2: ({ children, ...props }) => (
+                  <h2 {...props}>
+                    {hasSources ? renderWithCitations(children, message.sources!, onSourceClick, effectiveQuery) : children}
+                  </h2>
+                ),
+                h3: ({ children, ...props }) => (
+                  <h3 {...props}>
+                    {hasSources ? renderWithCitations(children, message.sources!, onSourceClick, effectiveQuery) : children}
+                  </h3>
+                ),
+                td: ({ children, ...props }) => (
+                  <td {...props}>
+                    {hasSources ? renderWithCitations(children, message.sources!, onSourceClick, effectiveQuery) : children}
+                  </td>
+                ),
               }}
             >
               {message.content}
@@ -123,14 +280,22 @@ export function ChatMessage({ message, onSourceClick }: Props) {
           {/* Source badges */}
           {hasSources && (
             <div className="mt-5 flex flex-wrap gap-2">
-              {message.sources!.map((s, i) => (
-                <SourceBadge
-                  key={`${s.file_name}-${s.page}-${i}`}
-                  source={s}
-                  index={i + 1}
-                  onClick={onSourceClick}
-                />
-              ))}
+              {message.sources!.map((s, i) => {
+                const result = message.results?.find(
+                  (r) => r.file_name === s.file_name && String(r.page) === String(s.page)
+                );
+                return (
+                  <SourceBadge
+                    key={`${s.file_name}-${s.page}-${i}`}
+                    source={{
+                      ...s,
+                      searchContext: result ? buildSearchContext(result) : s.searchContext,
+                    }}
+                    index={i + 1}
+                    onClick={(src) => onSourceClick(src, message.query)}
+                  />
+                );
+              })}
             </div>
           )}
 
@@ -182,11 +347,15 @@ export function ChatMessage({ message, onSourceClick }: Props) {
                         key={i}
                         className="group flex items-start gap-3 px-3 py-2.5 rounded-lg hover:bg-[var(--bg-secondary)] cursor-pointer transition-all"
                         onClick={() =>
-                          onSourceClick({
-                            file_name: r.file_name,
-                            page: r.page,
-                            title: r.section_title || r.file_name,
-                          })
+                          onSourceClick(
+                            {
+                              file_name: r.file_name,
+                              page: r.page,
+                              title: r.section_title || r.file_name,
+                              searchContext: buildSearchContext(r),
+                            },
+                            effectiveQuery
+                          )
                         }
                       >
                         <span className="text-[11px] font-semibold text-[var(--text-muted)] mt-0.5 w-4 text-right shrink-0">

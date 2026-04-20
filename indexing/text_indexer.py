@@ -3,7 +3,7 @@ Text indexer: load documents, chunk, build BM25 + Chroma vector index (claim_chu
 Does not touch image collection. Keeps existing Hybrid RAG indexing behavior.
 """
 import logging
-from typing import Optional
+from typing import Optional, Callable
 
 from document_loader import load_and_chunk_folder, Chunk
 from search_index import SearchIndex
@@ -62,6 +62,8 @@ def load_existing_index() -> Optional[SearchIndex]:
             doctor_name=meta.get("doctor_name", ""),
             doc_quality=meta.get("doc_quality", ""),
             embedding_text=meta.get("embedding_text", ""),
+            # Required for incremental chunking: must match document_loader.load_and_chunk_folder
+            last_modified=float(meta.get("last_modified", 0.0) or 0.0),
         )
         chunks.append(c)
 
@@ -76,7 +78,8 @@ def build_text_index(
     data_folder: Optional[str] = None,
     enable_vision: bool = False,
     vision_provider: str = "",
-    vision_api_key: str = ""
+    vision_api_key: str = "",
+    progress_callback: Optional[Callable[[int, str], None]] = None,
 ) -> SearchIndex:
     """
     Incremental build: load documents, chunk (skipping unchanged), and upsert to index.
@@ -88,18 +91,27 @@ def build_text_index(
     existing_chunks = existing_index.chunks if existing_index else None
     
     # 2. Extract and chunk (incremental)
+    if progress_callback:
+        progress_callback(10, "Chunking documents...")
     chunks = load_and_chunk_folder(
         data_folder, 
         existing_chunks=existing_chunks,
         enable_vision=enable_vision,
         vision_provider=vision_provider,
-        vision_api_key=vision_api_key
+        vision_api_key=vision_api_key,
+        progress_callback=progress_callback,
     )
     # 2b. Normalize patient names at index time (OCR variants -> canonical, no duplicates)
     normalize_patient_names_in_chunks(chunks)
 
     # 3. Build/Update index
+    if progress_callback:
+        progress_callback(65, "Building text index...")
     index = SearchIndex(chunks)
     index.build_bm25()
+    if progress_callback:
+        progress_callback(80, "Building vector index...")
     index.build_vector_index()
+    if progress_callback:
+        progress_callback(90, "Text index complete")
     return index

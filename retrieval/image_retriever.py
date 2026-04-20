@@ -20,6 +20,9 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
+# Pattern to detect filenames in queries (e.g. "flower.png", "report.pdf")
+_FILENAME_PATTERN = re.compile(r"\b([a-zA-Z0-9_\-]+\.(png|jpg|jpeg|gif|bmp|tiff|tif|pdf|webp))\b", re.IGNORECASE)
+
 _STOPWORDS = frozenset({
     "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
     "in", "on", "at", "to", "for", "of", "with", "by", "from", "and",
@@ -148,6 +151,37 @@ class ImageRetriever:
             collection = client.get_collection(name=CHROMA_IMAGE_COLLECTION_NAME)
         except Exception:
             return []
+
+        # When query explicitly mentions a filename (e.g. "flower.png"), fetch by metadata first
+        filename_hits = []
+        for m in _FILENAME_PATTERN.finditer(query):
+            fname = m.group(1)
+            try:
+                got = collection.get(where={"file_name": {"$eq": fname}}, include=["metadatas"])
+                ids_list = got.get("ids") or []
+                metas_list = got.get("metadatas") or []
+                if ids_list:
+                    for i, uid in enumerate(ids_list):
+                        meta = metas_list[i] if i < len(metas_list) else {}
+                        ocr_text = meta.get("ocr_text", "") or ""
+                        item = {
+                            "id": uid,
+                            "file_name": meta.get("file_name", ""),
+                            "path": meta.get("path", ""),
+                            "page": meta.get("page", 0),
+                            "doc_id": meta.get("doc_id", meta.get("file_name", "")),
+                            "file_type": meta.get("file_type", "image"),
+                            "is_pdf_page": meta.get("is_pdf_page", "False") == "True",
+                            "patient_name": meta.get("patient_name", "") or "",
+                            "report_type": meta.get("report_type", "") or "",
+                            "claim_number": meta.get("claim_number", "") or "",
+                            "ocr_text": ocr_text,
+                        }
+                        filename_hits.append((item, 1.0))
+                    break
+            except Exception as e:
+                logger.debug("Filename lookup for %s failed: %s", fname, e)
+
         model, processor = _load_clip()
         q_emb = _encode_query(model, processor, query)
         # Retrieve more if we will rerank; otherwise just top_n
@@ -188,7 +222,7 @@ class ImageRetriever:
         ids = results["ids"][0] if results["ids"] else []
         metadatas = results["metadatas"][0] if results.get("metadatas") else []
         distances = results["distances"][0] if results.get("distances") else []
-        out = []
+        out = list(filename_hits)
         for i, uid in enumerate(ids):
             meta = metadatas[i] if i < len(metadatas) else {}
             dist = float(distances[i]) if i < len(distances) and distances[i] is not None else 0
@@ -211,7 +245,9 @@ class ImageRetriever:
                 "claim_number": meta.get("claim_number", "") or "",
                 "ocr_text": ocr_text,
             }
-            out.append((item, score))
+            key = (item.get("file_name", ""), item.get("page", ""))
+            if key not in {(x[0].get("file_name"), x[0].get("page")) for x in out}:
+                out.append((item, score))
         # Re-sort by blended score (CLIP + OCR relevance)
         out.sort(key=lambda x: x[1], reverse=True)
         if USE_IMAGE_RERANKER and out:

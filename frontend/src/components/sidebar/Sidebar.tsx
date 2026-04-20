@@ -3,18 +3,15 @@ import {
   PenSquare,
   FolderOpen,
   Trash2,
-  Loader2,
   Settings,
   Stethoscope,
   ChevronRight,
-  FileStack,
-  Image,
   PanelLeft,
   Sun,
   Moon,
 } from "lucide-react";
 import type { Conversation, IndexInfo } from "../../lib/types";
-import { getIndexInfo, triggerReindexDocs, triggerReindexImages } from "../../lib/api";
+import { getIndexInfo } from "../../lib/api";
 
 interface Props {
   conversations: Conversation[];
@@ -46,7 +43,6 @@ export function Sidebar({
   onToggleTheme,
 }: Props) {
   const [indexInfo, setIndexInfo] = useState<IndexInfo | null>(null);
-  const [indexingType, setIndexingType] = useState<"" | "docs" | "images">("");
   const [showChats, setShowChats] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
 
@@ -56,20 +52,6 @@ export function Sidebar({
     const iv = setInterval(refresh, 8000);
     return () => clearInterval(iv);
   }, []);
-
-  useEffect(() => {
-    if (!indexingType) return;
-    const poll = setInterval(async () => {
-      try {
-        const info = await getIndexInfo();
-        setIndexInfo(info);
-        if (!info.indexing) { clearInterval(poll); setIndexingType(""); }
-      } catch { /* */ }
-    }, 3000);
-    return () => clearInterval(poll);
-  }, [indexingType]);
-
-  const isIndexing = !!indexingType || (indexInfo?.indexing ?? false);
 
   return (
     <div className="flex flex-col h-full bg-[var(--bg-sidebar)]">
@@ -191,22 +173,6 @@ export function Sidebar({
               </button>
             </div>
 
-            <button
-              onClick={() => { if (!isIndexing) { setIndexingType("docs"); triggerReindexDocs(); } }}
-              disabled={isIndexing}
-              className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-[13px] bg-[var(--bg-primary)] border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 transition-all"
-            >
-              {indexingType === "docs" ? <Loader2 size={13} className="animate-spin" /> : <FileStack size={13} />}
-              {indexingType === "docs" ? "Indexing Docs..." : "Re-index Docs"}
-            </button>
-            <button
-              onClick={() => { if (!isIndexing) { setIndexingType("images"); triggerReindexImages(); } }}
-              disabled={isIndexing}
-              className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-[13px] bg-[var(--bg-primary)] border border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-40 transition-all"
-            >
-              {indexingType === "images" ? <Loader2 size={13} className="animate-spin" /> : <Image size={13} />}
-              {indexingType === "images" ? "Indexing Images..." : "Re-index Images"}
-            </button>
             {indexInfo && (
               <p className="text-[11px] text-[var(--text-muted)] text-center pt-1">
                 {indexInfo.chunk_count} chunks · {indexInfo.tree_count} trees · {indexInfo.image_count} imgs

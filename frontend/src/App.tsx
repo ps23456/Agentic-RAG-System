@@ -3,6 +3,7 @@ import { Sidebar } from "./components/sidebar/Sidebar";
 import { ChatPanel } from "./components/chat/ChatPanel";
 import { DocumentViewer } from "./components/documents/DocumentViewer";
 import { DocumentsPage } from "./components/documents/DocumentsPage";
+import { FieldsPage } from "./components/fields/FieldsPage";
 import { MedicalPanel } from "./components/medical/MedicalPanel";
 import { useChat } from "./hooks/useChat";
 import { useDocumentViewer } from "./hooks/useDocumentViewer";
@@ -10,33 +11,51 @@ import { useTheme } from "./hooks/useTheme";
 import type { Source } from "./lib/types";
 import { PanelLeft } from "lucide-react";
 
-type View = "chat" | "documents" | "medical";
+type View = "chat" | "documents" | "medical" | "fields";
 
 export default function App() {
   const chat = useChat();
   const docViewer = useDocumentViewer();
   const { theme, toggle: toggleTheme } = useTheme();
   const [view, setView] = useState<View>("chat");
+  const [fieldsFile, setFieldsFile] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const lastQueryRef = useRef("");
 
-  const handleSend = (query: string, webSearch?: boolean) => {
+  const handleSend = (query: string, webSearch?: boolean, fileFilter?: string, evaluateRag?: boolean) => {
     setView("chat");
     lastQueryRef.current = query;
     chat.send(query, (sources: Source[]) => {
       if (sources.length > 0) {
         docViewer.openSource(sources[0], query);
       }
-    }, webSearch);
+    }, webSearch, undefined, fileFilter, evaluateRag);
   };
 
-  const handleSourceClick = (source: Source) => {
-    docViewer.openSource(source, lastQueryRef.current);
+  const handleSourceClick = (source: Source, query?: string) => {
+    if (source.url) {
+      window.open(source.url, "_blank", "noopener,noreferrer");
+    } else {
+      // For .md/.txt: use the message's query so we scroll to the RIGHT content.
+      // The chunk's searchContext can be from a wrong chunk (e.g. end-of-file)
+      // and would show footer instead of the cited section.
+      const isMdOrTxt = /\.(md|txt)$/i.test(source.file_name || "");
+      const effectiveQuery = query ?? lastQueryRef.current;
+      const search = isMdOrTxt && effectiveQuery
+        ? effectiveQuery
+        : (source.searchContext || effectiveQuery);
+      docViewer.openSource(source, search);
+    }
   };
 
   const handleChatWithDoc = (docName: string) => {
     setView("chat");
-    handleSend(`Tell me about ${docName}`);
+    handleSend(`Tell me about ${docName}`, false, docName);
+  };
+
+  const handleExtractFields = (docName: string) => {
+    setFieldsFile(docName);
+    setView("fields");
   };
 
   return (
@@ -72,7 +91,15 @@ export default function App() {
       <div className="flex-1 flex min-w-0">
         {view === "documents" ? (
           <div className="flex-1">
-            <DocumentsPage onBack={() => setView("chat")} onChatWithDoc={handleChatWithDoc} />
+            <DocumentsPage
+              onBack={() => setView("chat")}
+              onChatWithDoc={handleChatWithDoc}
+              onExtractFields={handleExtractFields}
+            />
+          </div>
+        ) : view === "fields" ? (
+          <div className="flex-1">
+            <FieldsPage onBack={() => setView("documents")} fileName={fieldsFile} />
           </div>
         ) : view === "medical" ? (
           <div className="flex-1">

@@ -1,7 +1,9 @@
 """Medical analysis endpoints."""
 import os
 import re
-from fastapi import APIRouter, UploadFile, File, Form
+
+from fastapi import APIRouter, UploadFile, File, Form, Query, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import List, Optional
 
@@ -25,6 +27,59 @@ async def list_patients():
             if os.path.isdir(os.path.join(base, d)):
                 patients.add(d.replace("_", " "))
     return {"patients": sorted(patients)}
+
+
+@router.get("/api/medical/files")
+async def list_patient_files(patient: str = ""):
+    """List medical file paths for a patient (for analyzing previously uploaded files)."""
+    if not patient.strip():
+        return {"paths": [], "files": []}
+    base = _medical_base()
+    safe = re.sub(r"[^\w\-]", "_", patient.strip())
+    patient_dir = os.path.join(base, safe)
+    paths = []
+    files = []
+    if os.path.isdir(patient_dir):
+        for root, _, filenames in os.walk(patient_dir):
+            for f in sorted(filenames):
+                ext = os.path.splitext(f)[1].lower()
+                if ext in {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}:
+                    full_path = os.path.join(root, f)
+                    paths.append(full_path)
+                    files.append({"path": full_path, "name": f, "page": 1})
+    return {"paths": paths, "files": files}
+
+
+@router.get("/api/medical/image")
+async def serve_medical_image(path: str = Query(...)):
+    """Serve a medical image or PDF page for preview. path = full server path (validated)."""
+    base = _medical_base()
+    base_real = os.path.realpath(base)
+    path_clean = os.path.normpath(path)
+    path_real = os.path.realpath(path_clean)
+    if not path_real.startswith(base_real) or ".." in path:
+        raise HTTPException(403, "Invalid path")
+    if not os.path.isfile(path_real):
+        raise HTTPException(404, "File not found")
+    ext = os.path.splitext(path_real)[1].lower()
+    if ext == ".pdf":
+        try:
+            import fitz
+            from PIL import Image as PILImage
+            doc = fitz.open(path_real)
+            pix = doc.load_page(0).get_pixmap(dpi=120, alpha=False)
+            buf = pix.tobytes("png")
+            doc.close()
+            return Response(content=buf, media_type="image/png")
+        except Exception as e:
+            raise HTTPException(500, str(e))
+    media_map = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".bmp": "image/bmp", ".tiff": "image/tiff", ".tif": "image/tiff",
+    }
+    media = media_map.get(ext, "application/octet-stream")
+    with open(path_real, "rb") as f:
+        return Response(content=f.read(), media_type=media)
 
 
 class ClassifyRequest(BaseModel):

@@ -6,12 +6,12 @@ import re
 import logging
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Iterator
+from typing import List, Iterator, Callable, Optional
 
 import pdfplumber
 import fitz  # PyMuPDF for fallback and page images for OCR
 import json
-from config import STRUCTURED_DOC_MIN_PAGES, DATA_FOLDER
+from config import DATA_FOLDER, MISTRAL_OCR_FORCE_FILENAMES, STRUCTURED_DOC_MIN_PAGES
 
 # Lazy OCR: don't import pytesseract at module level (it can crash the process on some systems).
 # We'll try to enable OCR when first needed.
@@ -94,6 +94,70 @@ def set_mistral_ocr_key(key: str):
         _reset_mistral_status()
 
 
+def _ensure_mistral_key_from_env() -> None:
+    """If the key was never set (e.g. CLI index without Streamlit), read MISTRAL_OCR_API_KEY."""
+    if _MISTRAL_OCR_KEY:
+        return
+    k = os.environ.get("MISTRAL_OCR_API_KEY", "").strip()
+    if k:
+        set_mistral_ocr_key(k)
+
+
+def _should_force_mistral_ocr(path: str) -> bool:
+    """
+    Force full-document Mistral OCR for PDFs that mix printed template text with handwriting:
+    normal heuristics keep enough embedded text that per-page OCR is skipped.
+
+    - Sidecar: same path + '.mistralocr' or '{stem}.mistralocr' next to the file (empty file is ok).
+    - Env MISTRAL_OCR_FORCE_FILENAMES: comma-separated basenames (case-insensitive).
+    """
+    base = os.path.basename(path)
+    stem = Path(path).stem
+    if os.path.isfile(path + ".mistralocr"):
+        return True
+    side2 = os.path.join(os.path.dirname(path) or ".", f"{stem}.mistralocr")
+    if os.path.isfile(side2):
+        return True
+    raw = (MISTRAL_OCR_FORCE_FILENAMES or "").strip()
+    if not raw:
+        return False
+    base_lower = base.lower()
+    for part in raw.split(","):
+        p = part.strip()
+        if p and p.lower() == base_lower:
+            return True
+    return False
+
+
+def _mistral_ocr_pdf_page_render(path: str, page_num: int) -> str:
+    """Render one PDF page to PNG and run Mistral image OCR. Returns text or ''."""
+    if not _MISTRAL_OCR_KEY or _is_mistral_disabled():
+        return ""
+    try:
+        import tempfile
+
+        doc = fitz.open(path)
+        page = doc.load_page(page_num - 1)
+        pix = page.get_pixmap(dpi=150, alpha=False)
+        buf = pix.tobytes("png")
+        doc.close()
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp.write(buf)
+            tmp_path = tmp.name
+        try:
+            pages = _mistral_ocr_image(tmp_path)
+            if pages:
+                return pages[0][1] or ""
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("Mistral OCR for PDF page failed: %s", e)
+    return ""
+
+
 def get_mistral_ocr_key() -> str:
     return _MISTRAL_OCR_KEY
 
@@ -134,6 +198,26 @@ def _mistral_ocr_pdf(path: str) -> List[tuple[int, str]]:
         else:
             logger.warning("Mistral OCR failed for PDF %s: %s", path, e)
         return []
+
+
+def mistral_ocr_pdf_to_markdown(path: str) -> str:
+    """
+    Run Mistral OCR on a PDF and return one markdown string (per-page ## sections).
+    Use for manual export; place a companion .md next to the PDF with the same stem to prefer it at index time.
+    Raises ValueError if Mistral is unavailable or returns nothing.
+    """
+    _ensure_mistral_key_from_env()
+    if not _MISTRAL_OCR_KEY or _is_mistral_disabled():
+        raise ValueError(
+            "Mistral OCR is not available. Set MISTRAL_OCR_API_KEY in .env and restart the server."
+        )
+    pages = _mistral_ocr_pdf(path)
+    if not pages:
+        raise ValueError(
+            "Mistral OCR returned no text. Check the PDF, API key, and quota; see server logs."
+        )
+    parts = [f"## Page {num}\n\n{text.strip()}" for num, text in pages]
+    return "\n\n".join(parts)
 
 
 def _mistral_ocr_image(path: str) -> List[tuple[int, str]]:
@@ -188,6 +272,7 @@ from config import (
     MARKDOWN_EXTENSIONS,
     JSON_EXTENSIONS,
     TEXT_EXTENSIONS,
+    MISTRAL_OCR_FORCE_FILENAMES,
     get_doc_type,
     CHUNK_BY,
     MAX_CHUNK_CHARS,
@@ -251,7 +336,10 @@ def extract_chunk_metadata(text: str) -> dict:
         return meta
 
     # Patient name: multiple patterns for form variations (Patient Name, Full Name, Insured)
+    # Mistral/markdown forms: |  Name *Teresa Brown* |
     patient_patterns = [
+        r"Name\s+\*([A-Za-z][A-Za-z\s\-']+)\*",
+        r"\|\s*Name\s+\*([A-Za-z][A-Za-z\s\-']+)\*\s*\|",
         r"(?:Patient\s+Name|Insured/Patient\s+Name|Insured\s+Name)\s*:?\s*([A-Za-z][A-Za-z\s\-]+?)(?:\s{2,}|\n|Claim|$|Policy|Group)",
         r"(?:Patient\s+Name|Insured/Patient\s+Name)\s*:?\s*([A-Za-z][A-Za-z\s\-]+)",
         r"Patient\s+Name\s+([A-Z][A-Za-z\s]+?)(?:\s+Claim|\s{2,}|\n|$)",
@@ -265,26 +353,34 @@ def extract_chunk_metadata(text: str) -> dict:
                 meta["patient_name"] = name
                 break
 
-    # Claim number: "Claim # 503-WOP-01", "Claim #503-WOP-01", "Claim 503-WOP-01"
+    # Claim number — specific patterns first (avoid r"Claim\s+(\w+)" matching "Claim Number" -> "Number").
     for pat in [
-        r"Claim\s*#\s*([\w\-]+)",
-        r"Claim\s+([\w\-]+)",
-        r"Claim\s+Number\s*:?\s*([\w\-]+)",
+        r"Claim\s+Number\s+\*([^\*\s\|]+)\*",
+        r"Claim\s+Number\s*:?\s*([\w\-.+]+)",
+        r"Claim\s*#\s*([\w\-.+]+)",
+        r"Claim\s+(\d[\w\-.+]*)(?=\s*\||\s*\n)",
     ]:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            meta["claim_number"] = _normalize_metadata_value(m.group(1))
+            raw = _normalize_metadata_value(m.group(1))
+            if raw.lower() in ("number", "no", "na", "n/a") or len(raw) < 2:
+                continue
+            meta["claim_number"] = raw
             break
 
-    # Policy number
+    # Policy number (avoid matching literal "Number" as value)
     for pat in [
+        r"Policy\s+Number\s+\*([^\*\s\|]+)\*",
         r"Policy\s+Number\s*:?\s*([\d\w\-]+)",
         r"Policy\s*#\s*([\d\w\-]+)",
-        r"Policy\s+([\d\w\-]+)",
+        r"Policy\s+(\d[\d\w\-]*)",
     ]:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            meta["policy_number"] = _normalize_metadata_value(m.group(1))
+            raw = _normalize_metadata_value(m.group(1))
+            if raw.lower() == "number" or len(raw) < 2:
+                continue
+            meta["policy_number"] = raw
             break
 
     # Group number
@@ -450,6 +546,11 @@ def extract_text_from_pdf_page(path: str, page_num: int) -> str:
     to show query-relevant context (e.g. "primary diagnosis").
     """
     try:
+        _ensure_mistral_key_from_env()
+        if _should_force_mistral_ocr(path) and _MISTRAL_OCR_KEY and not _is_mistral_disabled():
+            t = _mistral_ocr_pdf_page_render(path, page_num)
+            if t.strip():
+                return t.strip()
         doc = fitz.open(path)
         page = doc.load_page(page_num - 1)
         text = page.get_text() or ""
@@ -458,27 +559,9 @@ def extract_text_from_pdf_page(path: str, page_num: int) -> str:
             return text.strip()
         # Scanned page: prefer Mistral OCR when configured (matches index quality)
         if _MISTRAL_OCR_KEY and not _is_mistral_disabled():
-            import tempfile
-            try:
-                doc = fitz.open(path)
-                page = doc.load_page(page_num - 1)
-                pix = page.get_pixmap(dpi=150, alpha=False)
-                buf = pix.tobytes("png")
-                doc.close()
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                    tmp.write(buf)
-                    tmp_path = tmp.name
-                try:
-                    pages = _mistral_ocr_image(tmp_path)
-                    if pages:
-                        return pages[0][1] or ""
-                finally:
-                    try:
-                        os.remove(tmp_path)
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.debug("Mistral OCR for single page failed: %s", e)
+            t = _mistral_ocr_pdf_page_render(path, page_num)
+            if t.strip():
+                return t.strip()
         return _ocr_pdf_page(path, page_num)
     except Exception as e:
         logger.warning("extract_text_from_pdf_page failed for %s p.%s: %s", path, page_num, e)
@@ -632,9 +715,9 @@ def extract_text_from_pdf(path: str) -> List[tuple[int, str]]:
             # Try Mistral for this specific page if doc is small, else fallback to local Tesseract
             # Cloud OCR on every page of a large doc is too slow/expensive
             if _MISTRAL_OCR_KEY and not _is_mistral_disabled() and len(pages) < 10:
-                ocr_pages = _mistral_ocr_image(f"{path}_pg{page_num}") # Pseudopath, Mistral PDF OCR preferred for pages
-                # For now, just use local Tesseract for page-by-page to keep it fast
-                ocr_text = _ocr_pdf_page(path, page_num)
+                ocr_text = _mistral_ocr_pdf_page_render(path, page_num)
+                if not ocr_text.strip():
+                    ocr_text = _ocr_pdf_page(path, page_num)
                 result.append((page_num, ocr_text if ocr_text else text))
             else:
                 ocr_text = _ocr_pdf_page(path, page_num)
@@ -997,7 +1080,8 @@ def load_and_chunk_folder(
     existing_chunks: List[Chunk] | None = None,
     enable_vision: bool = False,
     vision_provider: str = "",
-    vision_api_key: str = ""
+    vision_api_key: str = "",
+    progress_callback: Optional[Callable[[int, str], None]] = None,
 ) -> List[Chunk]:
     """
     Read supported files from folder, extract text (with OCR or Docling), chunk.
@@ -1011,6 +1095,7 @@ def load_and_chunk_folder(
 
     all_chunks: List[Chunk] = []
     seen_bases: dict[str, int] = {}
+    processed_count = 0
 
     # Map existing chunks by filename for quick comparison
     file_map: dict[str, List[Chunk]] = {}
@@ -1049,6 +1134,11 @@ def load_and_chunk_folder(
                     logger.debug("Skipping unchanged file: %s", base)
                     all_chunks.extend(cached)
                     continue
+
+            if progress_callback:
+                pct = min(55, 15 + processed_count * 4)
+                progress_callback(pct, f"Processing {base}")
+                processed_count += 1
 
             if ext in PDF_EXTENSIONS:
                 pages = extract_text_from_pdf(path)

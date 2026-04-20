@@ -19,6 +19,7 @@ export function DocumentViewer({
   const [pageImage, setPageImage] = useState<string | null>(null);
   const [textContent, setTextContent] = useState<string | null>(null);
   const [scrollLine, setScrollLine] = useState(0);
+  const [matchedText, setMatchedText] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [zoom, setZoom] = useState(100);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -27,7 +28,12 @@ export function DocumentViewer({
   const v = viewers[activeIdx];
 
   useEffect(() => {
-    if (!v) { setPageImage(null); setTextContent(null); return; }
+    if (!v) {
+      setPageImage(null);
+      setTextContent(null);
+      setMatchedText("");
+      return;
+    }
     const ext = v.fileName.split(".").pop()?.toLowerCase() || "";
 
     if (ext === "pdf") {
@@ -40,10 +46,12 @@ export function DocumentViewer({
     } else if (["md", "txt", "csv", "json"].includes(ext)) {
       setLoading(true);
       setPageImage(null);
-      getDocumentText(v.fileName, v.searchContext)
+      const pageNum = typeof v?.page === "number" ? v.page : parseInt(String(v?.page)) || 1;
+      getDocumentText(v.fileName, v.searchContext, pageNum)
         .then((data) => {
           setTextContent(data.content);
           setScrollLine(data.scroll_line || 0);
+          setMatchedText(data.matched_text || "");
         })
         .catch(() => setTextContent(null))
         .finally(() => setLoading(false));
@@ -54,15 +62,20 @@ export function DocumentViewer({
   }, [v?.fileName, v?.page, v?.searchContext]);
 
   useEffect(() => {
-    if (highlightRef.current) {
-      highlightRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
-    } else if (scrollLine > 0 && contentRef.current) {
-      const lines = contentRef.current.querySelectorAll("p, li, h1, h2, h3, h4, h5, h6, pre, tr");
-      const targetIdx = Math.min(scrollLine, lines.length - 1);
-      if (lines[targetIdx]) {
-        lines[targetIdx].scrollIntoView({ behavior: "smooth", block: "center" });
+    if (!textContent) return;
+    const scrollToTarget = () => {
+      if (highlightRef.current) {
+        highlightRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
+      } else if (scrollLine > 0 && contentRef.current) {
+        const lines = contentRef.current.querySelectorAll("p, li, h1, h2, h3, h4, h5, h6, pre, tr");
+        const targetIdx = Math.min(scrollLine, lines.length - 1);
+        if (lines[targetIdx]) {
+          lines[targetIdx].scrollIntoView({ behavior: "smooth", block: "center" });
+        }
       }
-    }
+    };
+    const t = setTimeout(scrollToTarget, 150);
+    return () => clearTimeout(t);
   }, [textContent, scrollLine]);
 
   if (viewers.length === 0) {
@@ -79,11 +92,11 @@ export function DocumentViewer({
   const ext = v?.fileName.split(".").pop()?.toLowerCase() || "";
   const isPdf = ext === "pdf";
   const isImage = ["jpg", "jpeg", "png", "gif", "webp", "bmp"].includes(ext);
-  const searchCtx = v?.searchContext?.toLowerCase() || "";
+  const searchCtx = (matchedText || v?.searchContext || "").trim();
 
   function highlightText(text: string): React.ReactNode {
-    if (!searchCtx || searchCtx.length < 3) return text;
-    const idx = text.toLowerCase().indexOf(searchCtx);
+    if (!searchCtx || searchCtx.length < 5) return text;
+    const idx = text.toLowerCase().indexOf(searchCtx.toLowerCase());
     if (idx < 0) return text;
     return (
       <>

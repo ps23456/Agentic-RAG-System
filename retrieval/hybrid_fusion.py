@@ -153,22 +153,31 @@ def fuse_results(
     weights = MULTIMODAL_HYBRID_WEIGHTS.get(query_type, MULTIMODAL_HYBRID_WEIGHTS["hybrid"])
     w_text, w_image = weights
 
-    # Map key -> {text_rrf: float, image_rrf: float, content: Best_Content_Obj}
+    # Map key -> {text_rrf: float, image_rrf: float, content: Best_Content_Obj, best_score: float}
     registry = {}
     RRF_K = 60
 
-    # text_results is already sorted by score descending
-    for i, (chunk, _) in enumerate(text_results):
+    # text_results is already sorted by score descending (best first)
+    # Use BEST occurrence per (file, page): keep highest RRF and content from highest-scoring chunk
+    for i, (chunk, score) in enumerate(text_results):
         fn = getattr(chunk, "file_name", "unknown")
         pg = getattr(chunk, "page_number", 0)
         key = (fn, pg)
-        
         rrf_score = 1.0 / (RRF_K + i + 1)
         if key not in registry:
-            registry[key] = {"text_rrf": 0.0, "image_rrf": 0.0, "content": chunk}
-        
-        if rrf_score > registry[key]["text_rrf"]:
-            registry[key]["text_rrf"] = rrf_score
+            registry[key] = {
+                "text_rrf": rrf_score,
+                "image_rrf": 0.0,
+                "content": chunk,
+                "best_score": float(score),
+            }
+        else:
+            # Same page from different source (e.g. tree vs chunk): keep best RRF and best-scoring content
+            if rrf_score > registry[key]["text_rrf"]:
+                registry[key]["text_rrf"] = rrf_score
+            if score > registry[key]["best_score"]:
+                registry[key]["content"] = chunk
+                registry[key]["best_score"] = float(score)
 
     # image_results is already sorted by score descending
     for i, (img_item, _) in enumerate(image_results):
@@ -178,7 +187,12 @@ def fuse_results(
         
         rrf_score = 1.0 / (RRF_K + i + 1)
         if key not in registry:
-            registry[key] = {"text_rrf": 0.0, "image_rrf": rrf_score, "content": img_item}
+            registry[key] = {
+                "text_rrf": 0.0,
+                "image_rrf": rrf_score,
+                "content": img_item,
+                "best_score": -1.0,
+            }
         else:
             if rrf_score > registry[key]["image_rrf"]:
                 registry[key]["image_rrf"] = rrf_score
