@@ -1,4 +1,4 @@
-import type { ChatResponse, DocumentPage, FieldsExtractResponse, IndexInfo, UploadedFile } from "./types";
+import type { ChatResponse, DocumentPage, FieldsExtractResponse, IndexInfo, ResultItem, Source, UploadedFile } from "./types";
 
 const API = "";
 
@@ -19,6 +19,117 @@ export async function sendChat(
       file_filter: fileFilter ?? null,
       evaluate_rag: evaluateRag ?? false,
     }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export interface StreamMeta {
+  intent: string;
+  reasoning: string;
+  results: ResultItem[];
+  sources: Source[];
+}
+
+export interface StreamDone {
+  summary: string;
+  sources: Source[];
+  results: ResultItem[];
+  intent: string;
+  reasoning: string;
+}
+
+export interface StreamStatus {
+  stage: string;
+}
+
+export interface StreamHandlers {
+  onStatus?: (status: StreamStatus) => void;
+  onMeta?: (meta: StreamMeta) => void;
+  onToken?: (token: string) => void;
+  onDone?: (done: StreamDone) => void;
+  onError?: (err: string) => void;
+}
+
+/**
+ * Stream a chat response. Emits `meta` (sources/results) first, then a series
+ * of `token` deltas, then a final `done` event. Returns once the stream closes.
+ */
+export async function sendChatStream(
+  query: string,
+  handlers: StreamHandlers,
+  opts?: {
+    patientFilter?: string;
+    webSearch?: boolean;
+    fileFilter?: string;
+    signal?: AbortSignal;
+  }
+): Promise<void> {
+  const res = await fetch(`${API}/api/chat/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query,
+      patient_filter: opts?.patientFilter,
+      web_search: opts?.webSearch ?? false,
+      file_filter: opts?.fileFilter ?? null,
+    }),
+    signal: opts?.signal,
+  });
+  if (!res.ok || !res.body) throw new Error(await res.text());
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let idx: number;
+    while ((idx = buffer.indexOf("\n\n")) !== -1) {
+      const raw = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      const lines = raw.split("\n");
+      let event = "message";
+      let data = "";
+      for (const line of lines) {
+        if (line.startsWith("event: ")) event = line.slice(7).trim();
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!data) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        parsed = data;
+      }
+      if (event === "status") handlers.onStatus?.(parsed as StreamStatus);
+      else if (event === "meta") handlers.onMeta?.(parsed as StreamMeta);
+      else if (event === "token") handlers.onToken?.(typeof parsed === "string" ? parsed : String(parsed));
+      else if (event === "done") handlers.onDone?.(parsed as StreamDone);
+      else if (event === "error") handlers.onError?.(typeof parsed === "string" ? parsed : JSON.stringify(parsed));
+    }
+  }
+}
+
+export interface EvaluateResult {
+  evaluation: Record<string, number> | null;
+  evaluation_error: string | null;
+  evaluation_notes: string | null;
+}
+
+/** Non-blocking RAGAs evaluation. Call AFTER the chat stream completes. */
+export async function evaluateChat(
+  query: string,
+  summary: string,
+  results: ResultItem[]
+): Promise<EvaluateResult> {
+  const res = await fetch(`${API}/api/chat/evaluate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, summary, results }),
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();

@@ -1,17 +1,9 @@
 import { useState, useCallback } from "react";
 import type { ChatMessage, Conversation, Source } from "../lib/types";
-import { sendChat } from "../lib/api";
+import { sendChatStream, evaluateChat } from "../lib/api";
 import { generateId } from "../lib/utils";
 
 const STORAGE_KEY = "ics_conversations";
-
-/** Match a document filename in natural language (aligned with backend agentic_rag _FILENAME_PATTERN). */
-function inferScopedFileFromQuery(query: string): string | undefined {
-  const m = query.match(
-    /\b([A-Za-z0-9_\-]+(?:\s*\(\d+\))?\.(?:png|jpg|jpeg|gif|bmp|tiff|tif|pdf|webp|md|txt|json))\b/i
-  );
-  return m ? m[1] : undefined;
-}
 
 function loadConversations(): Conversation[] {
   try {
@@ -96,61 +88,145 @@ export function useChat() {
       persist(convos);
       setLoading(true);
 
+      const assistantId = generateId();
+      const t0 = Date.now();
+      let firstTokenAt: number | null = null;
+      let accumulated = "";
+      let lastFlush = 0;
+      let finalResults: ChatMessage["results"] = [];
+      let finalSources: Source[] = [];
+      let finalIntent = "";
+      let finalReasoning = "";
+
+      // Create the assistant placeholder so the UI shows the shimmer immediately.
+      const placeholder: ChatMessage = {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+        timestamp: Date.now(),
+        query,
+        ragasRequested: Boolean(evaluateRag),
+      };
+      convos = convos.map((c) =>
+        c.id === convId ? { ...c, messages: [...c.messages, placeholder] } : c
+      );
+      persist(convos);
+
+      const patchAssistant = (patch: Partial<ChatMessage>) => {
+        setConversations((prev) => {
+          const next = prev.map((c) =>
+            c.id === convId
+              ? {
+                  ...c,
+                  messages: c.messages.map((m) =>
+                    m.id === assistantId ? { ...m, ...patch } : m
+                  ),
+                }
+              : c
+          );
+          saveConversations(next);
+          return next;
+        });
+      };
+
       try {
-        const t0 = Date.now();
-        const resp = await sendChat(query, patientFilter, webSearch, effectiveFile, evaluateRag);
-        const elapsed = Math.round((Date.now() - t0) / 1000);
-
-        const assistantMsg: ChatMessage = {
-          id: generateId(),
-          role: "assistant",
-          content: resp.summary || "No results found for your query.",
-          sources: resp.sources,
-          results: resp.results,
-          intent: resp.intent,
-          reasoning: resp.reasoning,
-          thinkingTime: elapsed,
-          timestamp: Date.now(),
+        await sendChatStream(
           query,
-          evaluation: resp.evaluation ?? undefined,
-          evaluation_error: resp.evaluation_error ?? undefined,
-          evaluation_notes: resp.evaluation_notes ?? undefined,
-          ragasRequested: Boolean(evaluateRag),
-        };
-
-        convos = convos.map((c) =>
-          c.id === convId ? { ...c, messages: [...c.messages, assistantMsg] } : c
-        );
-        persist(convos);
-
-        let autoSources = resp.sources || [];
-        if (autoSources.length === 0 && resp.results?.length) {
-          const seen = new Set<string>();
-          for (const r of resp.results) {
-            const key = `${r.file_name}:${r.page}`;
-            if (r.file_name && !seen.has(key)) {
-              autoSources.push({ file_name: r.file_name, page: r.page, title: r.file_name });
-              seen.add(key);
-            }
-            if (autoSources.length >= 3) break;
+          {
+            onMeta: (meta) => {
+              finalResults = meta.results || [];
+              finalSources = meta.sources || [];
+              finalIntent = meta.intent || "";
+              finalReasoning = meta.reasoning || "";
+              patchAssistant({
+                sources: finalSources,
+                results: finalResults,
+                intent: finalIntent,
+                reasoning: finalReasoning,
+              });
+              if (onSource && finalSources.length > 0) onSource(finalSources);
+            },
+            onToken: (tok) => {
+              if (firstTokenAt === null) firstTokenAt = Date.now();
+              accumulated += tok;
+              // Throttle re-renders to ~10/s while streaming.
+              const now = Date.now();
+              if (now - lastFlush > 80) {
+                lastFlush = now;
+                patchAssistant({ content: accumulated });
+              }
+            },
+            onDone: (done) => {
+              if (done.summary) accumulated = done.summary;
+              finalResults = done.results || finalResults;
+              finalSources = done.sources || finalSources;
+              finalIntent = done.intent || finalIntent;
+              finalReasoning = done.reasoning || finalReasoning;
+            },
+            onError: (err) => {
+              accumulated = accumulated || `Error: ${err}`;
+            },
+          },
+          {
+            patientFilter,
+            webSearch,
+            fileFilter: effectiveFile,
           }
-        }
-        if (onSource && autoSources.length > 0) {
-          onSource(autoSources);
-        }
-      } catch (e: unknown) {
-        const errMsg: ChatMessage = {
-          id: generateId(),
-          role: "assistant",
-          content: `Error: ${e instanceof Error ? e.message : "Unknown error"}`,
-          timestamp: Date.now(),
-        };
-        convos = convos.map((c) =>
-          c.id === convId ? { ...c, messages: [...c.messages, errMsg] } : c
         );
-        persist(convos);
-      } finally {
-        setLoading(false);
+      } catch (e: unknown) {
+        accumulated = accumulated || `Error: ${e instanceof Error ? e.message : "Unknown error"}`;
+      }
+
+      // Final commit with "Thought for" based on first-token latency so the
+      // number matches what the user actually perceived.
+      const firstTokenLatency = firstTokenAt
+        ? Math.round((firstTokenAt - t0) / 1000)
+        : Math.round((Date.now() - t0) / 1000);
+
+      let autoSources = finalSources;
+      if ((!autoSources || autoSources.length === 0) && finalResults?.length) {
+        autoSources = [];
+        const seen = new Set<string>();
+        for (const r of finalResults) {
+          const key = `${r.file_name}:${r.page}`;
+          if (r.file_name && !seen.has(key)) {
+            autoSources.push({ file_name: r.file_name, page: r.page, title: r.file_name });
+            seen.add(key);
+          }
+          if (autoSources.length >= 3) break;
+        }
+      }
+
+      patchAssistant({
+        content: accumulated || "No results found for your query.",
+        sources: autoSources,
+        results: finalResults,
+        intent: finalIntent,
+        reasoning: finalReasoning,
+        thinkingTime: firstTokenLatency,
+      });
+
+      if (onSource && autoSources && autoSources.length > 0) {
+        onSource(autoSources);
+      }
+
+      setLoading(false);
+
+      // Kick off RAGAs evaluation in the background — never block the user.
+      if (evaluateRag && accumulated && finalResults?.length) {
+        evaluateChat(query, accumulated, finalResults)
+          .then((ev) => {
+            patchAssistant({
+              evaluation: ev.evaluation ?? undefined,
+              evaluation_error: ev.evaluation_error ?? undefined,
+              evaluation_notes: ev.evaluation_notes ?? undefined,
+            });
+          })
+          .catch((err) => {
+            patchAssistant({
+              evaluation_error: err instanceof Error ? err.message : String(err),
+            });
+          });
       }
     },
     [activeId, conversations, persist]

@@ -2,7 +2,6 @@ import { useState, useEffect } from "react";
 import {
   ArrowLeft,
   Loader2,
-  Upload,
   Stethoscope,
   X,
   User,

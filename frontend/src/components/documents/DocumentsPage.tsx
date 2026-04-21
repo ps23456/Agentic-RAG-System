@@ -58,8 +58,6 @@ export function DocumentsPage({ onBack, onChatWithDoc, onExtractFields }: Props)
     images: string[];
   }>(null);
   const [lastIndexResult, setLastIndexResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
-  /** PDF basenames uploaded in the last batch — offer Mistral OCR → .md download */
-  const [mistralPromptPdfs, setMistralPromptPdfs] = useState<string[]>([]);
   const [mistralLoading, setMistralLoading] = useState<string | null>(null);
   const indexBeforeRef = useRef<{ chunks: number; trees: number; images: number } | null>(null);
 

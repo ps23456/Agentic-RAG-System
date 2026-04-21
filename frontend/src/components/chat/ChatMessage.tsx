@@ -1,7 +1,6 @@
 import React, { useState, useCallback } from "react";
 import {
   ChevronDown,
-  Sparkles,
   CheckCircle2,
   Bot,
   Layers,
@@ -77,19 +76,16 @@ function renderWithCitations(
       parts.push(child.slice(lastIndex));
       return <>{parts}</>;
     }
-    if (child && typeof child === "object" && "props" in child && (child as React.ReactElement).props.children) {
-      return {
-        ...child,
-        props: {
-          ...(child as React.ReactElement).props,
-          children: renderWithCitations(
-            (child as React.ReactElement).props.children,
-            sources,
-            onSourceClick,
-            effectiveQuery
-          ),
-        },
-      };
+    if (React.isValidElement(child) && child.props && typeof child.props === "object" && "children" in child.props) {
+      const element = child as React.ReactElement<{ children?: React.ReactNode }>;
+      return React.cloneElement(element, {
+        children: renderWithCitations(
+          element.props.children,
+          sources,
+          onSourceClick,
+          effectiveQuery
+        ),
+      });
     }
     return child;
   });
@@ -106,6 +102,7 @@ function buildSearchContext(r: ResultItem): string | undefined {
 
 interface Props {
   message: Msg;
+  query?: string;
   onSourceClick: (source: Source, query?: string) => void;
 }
 
@@ -221,10 +218,10 @@ export function ChatMessage({ message, query: queryProp, onSourceClick }: Props)
                   <p className="text-[13px] text-amber-950/90 dark:text-amber-100/90 leading-snug">
                     {message.evaluation_error}
                   </p>
-                ) : message.ragasRequested ? (
-                  <p className="text-[13px] text-[var(--text-muted)]">
-                    No scores in this response. Send the message again with RAGAs on, or hard-refresh the app so the
-                    latest frontend is loaded.
+                ) : message.ragasRequested && !message.evaluation_notes ? (
+                  <p className="flex items-center gap-2 text-[13px] text-[var(--text-muted)]">
+                    <span className="inline-block w-3 h-3 rounded-full border-2 border-amber-500/40 border-t-amber-600 animate-spin" />
+                    Evaluating quality... this runs in the background and may take 30-120s.
                   </p>
                 ) : null
               ) : null}

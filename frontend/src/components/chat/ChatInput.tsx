@@ -8,13 +8,27 @@ interface Props {
   onUploadClick?: () => void;
 }
 
+const RAGAS_STORAGE_KEY = "ics_ragas_enabled";
+
 export function ChatInput({ onSend, disabled, onUploadClick }: Props) {
   const [value, setValue] = useState("");
   const [webSearch, setWebSearch] = useState(false);
-  const [evaluateRag, setEvaluateRag] = useState(false);
+  const [evaluateRag, setEvaluateRag] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(RAGAS_STORAGE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
   const ref = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => { ref.current?.focus(); }, [disabled]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(RAGAS_STORAGE_KEY, evaluateRag ? "1" : "0");
+    } catch { /* ignore */ }
+  }, [evaluateRag]);
 
   useEffect(() => {
     const el = ref.current;
@@ -69,7 +83,7 @@ export function ChatInput({ onSend, disabled, onUploadClick }: Props) {
               <button
                 type="button"
                 onClick={() => setEvaluateRag(!evaluateRag)}
-                title="Run RAGAs faithfulness + answer relevancy (slower; Groq first, OpenAI fallback)"
+                title="RAGAs runs faithfulness + answer-relevancy checks AFTER your answer is shown. Off by default — doesn't slow down responses."
                 className={`px-2.5 py-1.5 rounded-xl text-[12px] font-medium transition-all ${
                   evaluateRag
                     ? "bg-amber-100 text-amber-900 dark:bg-amber-900/30 dark:text-amber-200"
