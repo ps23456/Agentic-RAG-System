@@ -41,12 +41,22 @@ interface Props {
 
 export function DocumentsPage({ onBack, onChatWithDoc, onExtractFields }: Props) {
   const [files, setFiles] = useState<UploadedFile[]>([]);
+  /** Avoids the "No documents yet" flash on initial mount before the first fetch resolves. */
+  const [filesLoaded, setFilesLoaded] = useState(false);
   const [search, setSearch] = useState("");
   const [uploading, setUploading] = useState(false);
   const [indexInfo, setIndexInfo] = useState<IndexInfo | null>(null);
   const [indexingType, setIndexingType] = useState<"" | "docs" | "images">("");
   const [deleting, setDeleting] = useState<string | null>(null);
-  const [showIndexPrompt, setShowIndexPrompt] = useState(false);
+  /**
+   * Post-upload index prompt: tracks the exact file names that were just uploaded so we can
+   * (a) only show the matching button(s), and
+   * (b) send those names to the backend so only those files get indexed.
+   */
+  const [showIndexPrompt, setShowIndexPrompt] = useState<null | {
+    docs: string[];
+    images: string[];
+  }>(null);
   const [lastIndexResult, setLastIndexResult] = useState<{ type: "success" | "error"; message: string } | null>(null);
   /** PDF basenames uploaded in the last batch — offer Mistral OCR → .md download */
   const [mistralPromptPdfs, setMistralPromptPdfs] = useState<string[]>([]);
@@ -54,7 +64,10 @@ export function DocumentsPage({ onBack, onChatWithDoc, onExtractFields }: Props)
   const indexBeforeRef = useRef<{ chunks: number; trees: number; images: number } | null>(null);
 
   const refresh = useCallback(() => {
-    listDocuments().then((d) => setFiles(d.files)).catch(() => {});
+    listDocuments()
+      .then((d) => setFiles(d.files))
+      .catch(() => {})
+      .finally(() => setFilesLoaded(true));
     getIndexInfo().then(setIndexInfo).catch(() => {});
   }, []);
 
@@ -71,7 +84,7 @@ export function DocumentsPage({ onBack, onChatWithDoc, onExtractFields }: Props)
         if (!info.indexing) {
           clearInterval(poll);
           setIndexingType("");
-          setShowIndexPrompt(false);
+          setShowIndexPrompt(null);
           refresh();
           // Show completion message with before/after delta
           if (info.status?.startsWith("error:")) {
@@ -106,13 +119,12 @@ export function DocumentsPage({ onBack, onChatWithDoc, onExtractFields }: Props)
     return () => clearInterval(poll);
   }, [indexingType, refresh]);
 
-  // Keep UI mode aligned with backend status (covers refresh/reopen or stale local state).
+  // Pick up backend-side indexing triggered elsewhere (refresh/reopen).
+  // We ONLY set indexingType here; clearing it is owned by the polling effect above,
+  // which reads fresh status. Clearing from stale indexInfo caused the progress banner
+  // to flash off right after the user clicked Index Docs/Images.
   useEffect(() => {
-    if (!indexInfo) return;
-    if (!indexInfo.indexing) {
-      if (indexingType) setIndexingType("");
-      return;
-    }
+    if (!indexInfo || !indexInfo.indexing) return;
     if (indexInfo.status === "indexing_docs" && indexingType !== "docs") {
       setIndexingType("docs");
     } else if (indexInfo.status === "indexing_images" && indexingType !== "images") {
@@ -129,37 +141,59 @@ export function DocumentsPage({ onBack, onChatWithDoc, onExtractFields }: Props)
       if (!input.files) return;
       setUploading(true);
       try {
-        await uploadFiles(Array.from(input.files));
+        const result = await uploadFiles(Array.from(input.files));
         refresh();
-        setShowIndexPrompt(true);
-      } catch {
-        /* */
+        if (result.count > 0) {
+          setShowIndexPrompt({ docs: result.docs, images: result.images });
+        }
+      } catch (e) {
+        setLastIndexResult({
+          type: "error",
+          message: e instanceof Error ? e.message : "Upload failed — is the backend running on :8000?",
+        });
+        setTimeout(() => setLastIndexResult(null), 8000);
       }
       setUploading(false);
     };
     input.click();
   };
 
-  const handleReindexDocs = async () => {
+  /**
+   * Re-index documents.
+   * @param files  Optional list of basenames to index. When provided (e.g. from the
+   *               post-upload banner), only those files are re-processed and the rest
+   *               of the index stays untouched. Toolbar button omits this to perform
+   *               a full incremental scan.
+   */
+  const handleReindexDocs = async (files?: string[]) => {
     if (indexingType || indexInfo?.indexing) return;
     indexBeforeRef.current = {
       chunks: indexInfo?.chunk_count ?? 0,
       trees: indexInfo?.tree_count ?? 0,
       images: indexInfo?.image_count ?? 0,
     };
-    const resp = await triggerReindexDocs();
-    if (resp.status === "started") setIndexingType("docs");
+    const resp = await triggerReindexDocs(files);
+    if (resp.status === "started") {
+      setIndexingType("docs");
+      // Fetch fresh status right away so the progress bar shows live backend state
+      // instead of waiting for the 800ms poll.
+      getIndexInfo().then(setIndexInfo).catch(() => {});
+    }
   };
 
-  const handleReindexImages = async () => {
+  /** Re-index images. See {@link handleReindexDocs} for `files` semantics. */
+  const handleReindexImages = async (files?: string[]) => {
     if (indexingType || indexInfo?.indexing) return;
     indexBeforeRef.current = {
       chunks: indexInfo?.chunk_count ?? 0,
       trees: indexInfo?.tree_count ?? 0,
       images: indexInfo?.image_count ?? 0,
     };
-    const resp = await triggerReindexImages();
-    if (resp.status === "started") setIndexingType("images");
+    const resp = await triggerReindexImages(files);
+    if (resp.status === "started") {
+      setIndexingType("images");
+      getIndexInfo().then(setIndexInfo).catch(() => {});
+    }
   };
 
   const handleMistralDownload = async (fileName: string) => {
@@ -245,8 +279,9 @@ export function DocumentsPage({ onBack, onChatWithDoc, onExtractFields }: Props)
           <div className="w-px h-6 bg-[var(--border)]" />
 
           <button
-            onClick={handleReindexDocs}
+            onClick={() => handleReindexDocs()}
             disabled={isIndexing}
+            title="Re-scan all documents in the folder (incremental)"
             className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium border transition-all shadow-sm ${
               indexingType === "docs"
                 ? "bg-[var(--accent-light)] border-[var(--accent)] text-[var(--accent)]"
@@ -262,8 +297,9 @@ export function DocumentsPage({ onBack, onChatWithDoc, onExtractFields }: Props)
           </button>
 
           <button
-            onClick={handleReindexImages}
+            onClick={() => handleReindexImages()}
             disabled={isIndexing}
+            title="Re-scan all images in the folder (incremental)"
             className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium border transition-all shadow-sm ${
               indexingType === "images"
                 ? "bg-[var(--accent-light)] border-[var(--accent)] text-[var(--accent)]"
@@ -291,29 +327,49 @@ export function DocumentsPage({ onBack, onChatWithDoc, onExtractFields }: Props)
         </div>
       </div>
 
-      {/* Index prompt - shown after upload */}
-      {showIndexPrompt && !isIndexing && (
+      {/* Post-upload index prompt: only shows buttons for file kinds actually uploaded,
+          and clicking those buttons sends the exact uploaded filenames to the backend
+          so only those files are indexed (the rest of the index is untouched). */}
+      {showIndexPrompt && !isIndexing && (showIndexPrompt.docs.length > 0 || showIndexPrompt.images.length > 0) && (() => {
+        const docsCount = showIndexPrompt.docs.length;
+        const imagesCount = showIndexPrompt.images.length;
+        const onlyName = docsCount + imagesCount === 1
+          ? [...showIndexPrompt.docs, ...showIndexPrompt.images][0]
+          : null;
+        return (
         <div className="mx-6 mt-3 flex flex-wrap items-center justify-between gap-3 px-4 py-3 bg-[var(--accent-bg)] border border-[var(--accent-light)] rounded-xl">
-          <p className="text-sm text-[var(--accent)] font-medium min-w-0">
-            Documents uploaded. Index them to make them searchable.
+          <p className="text-sm text-[var(--accent)] font-medium min-w-0 truncate">
+            {onlyName
+              ? `Uploaded ${onlyName}. Click ${imagesCount === 1 ? "Index Images" : "Index Docs"} to make it searchable in chat.`
+              : docsCount > 0 && imagesCount > 0
+              ? `Uploaded ${docsCount} doc${docsCount === 1 ? "" : "s"} and ${imagesCount} image${imagesCount === 1 ? "" : "s"}. Index to make them searchable in chat.`
+              : imagesCount > 0
+              ? `Uploaded ${imagesCount} image${imagesCount === 1 ? "" : "s"}. Click Index Images to make them searchable in chat.`
+              : `Uploaded ${docsCount} doc${docsCount === 1 ? "" : "s"}. Click Index Docs to make them searchable in chat.`}
           </p>
           <div className="flex items-center gap-2 shrink-0">
+            {docsCount > 0 && (
+              <button
+                onClick={() => handleReindexDocs(showIndexPrompt.docs)}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)] transition-colors"
+                title={`Indexes only: ${showIndexPrompt.docs.join(", ")}`}
+              >
+                <FileStack size={12} />
+                Index Docs{docsCount > 1 ? ` (${docsCount})` : ""}
+              </button>
+            )}
+            {imagesCount > 0 && (
+              <button
+                onClick={() => handleReindexImages(showIndexPrompt.images)}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)] transition-colors"
+                title={`Indexes only: ${showIndexPrompt.images.join(", ")}`}
+              >
+                <Image size={12} />
+                Index Images{imagesCount > 1 ? ` (${imagesCount})` : ""}
+              </button>
+            )}
             <button
-              onClick={handleReindexDocs}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)] transition-colors"
-            >
-              <FileStack size={12} />
-              Index Docs
-            </button>
-            <button
-              onClick={handleReindexImages}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)] transition-colors"
-            >
-              <Image size={12} />
-              Index Images
-            </button>
-            <button
-              onClick={() => setShowIndexPrompt(false)}
+              onClick={() => setShowIndexPrompt(null)}
               className="p-1.5 rounded-lg text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors"
               title="Dismiss"
             >
@@ -321,7 +377,8 @@ export function DocumentsPage({ onBack, onChatWithDoc, onExtractFields }: Props)
             </button>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* Completion/error message after indexing */}
       {lastIndexResult && (
@@ -384,7 +441,24 @@ export function DocumentsPage({ onBack, onChatWithDoc, onExtractFields }: Props)
           )}
         </div>
 
-        {filtered.length === 0 ? (
+        {!filesLoaded ? (
+          // Skeleton placeholders while the first /api/documents fetch is in flight.
+          // Avoids a brief "No documents yet" flash before the file list arrives.
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {Array.from({ length: 6 }).map((_, i) => (
+              <div
+                key={i}
+                className="flex items-center gap-4 p-4 bg-[var(--bg-primary)] border border-[var(--border-light)] rounded-2xl animate-pulse"
+              >
+                <div className="w-12 h-12 rounded-xl bg-[var(--bg-secondary)] shrink-0" />
+                <div className="flex-1 min-w-0 space-y-2">
+                  <div className="h-3 w-3/4 bg-[var(--bg-secondary)] rounded" />
+                  <div className="h-2 w-1/3 bg-[var(--bg-secondary)] rounded" />
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : filtered.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-20 px-6 rounded-2xl border-2 border-dashed border-[var(--border)] bg-[var(--bg-secondary)]/30">
             <div className="w-16 h-16 rounded-2xl bg-[var(--bg-tertiary)] flex items-center justify-center mb-4">
               <FileText size={32} className="text-[var(--text-muted)]" />

@@ -164,6 +164,7 @@ def _collect_image_items(
     data_folder: str,
     existing_mtimes: dict[str, float] | None = None,
     progress_callback: Optional[Callable[[int, str], None]] = None,
+    file_filter: set[str] | None = None,
 ) -> List[dict]:
     """
     Collect indexable image items: image files + PDF pages rendered as images.
@@ -183,7 +184,12 @@ def _collect_image_items(
             path = os.path.join(root, name)
             ext = Path(path).suffix.lower()
             base = os.path.basename(path)
-            
+
+            # Targeted indexing: when a file_filter is provided, only those files are processed.
+            # Cached entries for other files are left intact in Chroma (upsert semantics).
+            if file_filter is not None and base not in file_filter:
+                continue
+
             # Incremental check
             mtime = os.path.getmtime(path)
             if existing_mtimes and base in existing_mtimes:
@@ -320,10 +326,14 @@ def _encode_images(model, processor, images: List[Any]) -> List[List[float]]:
 def build_image_index(
     data_folder: str | None = None,
     progress_callback: Optional[Callable[[int, str], None]] = None,
+    file_filter: set[str] | None = None,
 ) -> int:
     """
     Build the image-only Chroma collection (CLIP image embeddings).
     Does not index text; does not touch claim_chunks.
+
+    `file_filter` (set of basenames): when set, only those files are walked/embedded;
+    existing Chroma entries for other files are left unchanged (upsert is additive).
     Returns number of image items indexed.
     """
     data_folder = data_folder or DATA_FOLDER
@@ -367,7 +377,10 @@ def build_image_index(
     if progress_callback:
         progress_callback(8, "Collecting images...")
     image_items = _collect_image_items(
-        data_folder, existing_mtimes=existing_mtimes, progress_callback=progress_callback
+        data_folder,
+        existing_mtimes=existing_mtimes,
+        progress_callback=progress_callback,
+        file_filter=file_filter,
     )
     if image_items:
         from retrieval.agentic_rag import normalize_patient_names_in_items

@@ -417,8 +417,12 @@ class RAGService:
         self._index_progress = min(100, max(0, percent))
         self._index_stage = stage
 
-    def reindex_docs(self):
-        """Re-index documents: text chunks + tree indexes."""
+    def reindex_docs(self, file_filter: set[str] | None = None):
+        """Re-index documents: text chunks + tree indexes.
+
+        `file_filter` (set of basenames): when provided, only those files are re-chunked.
+        Page trees are still rebuilt from the full folder (cheap + avoids stale structure).
+        """
         if self._indexing:
             return
         self._indexing = True
@@ -442,6 +446,7 @@ class RAGService:
                 vision_provider=provider,
                 vision_api_key=llm_key,
                 progress_callback=on_progress,
+                file_filter=file_filter,
             )
 
             self._set_progress(70, "Building trees...")
@@ -460,8 +465,12 @@ class RAGService:
         finally:
             self._indexing = False
 
-    def reindex_images(self):
-        """Re-index images only."""
+    def reindex_images(self, file_filter: set[str] | None = None):
+        """Re-index images only.
+
+        `file_filter` (set of basenames): when provided, only those files are embedded.
+        Existing Chroma entries for other files are left unchanged.
+        """
         if self._indexing:
             return
         self._indexing = True
@@ -474,7 +483,11 @@ class RAGService:
             def on_progress(pct: int, stage: str):
                 self._set_progress(pct, stage)
 
-            build_image_index(self.data_folder, progress_callback=on_progress)
+            build_image_index(
+                self.data_folder,
+                progress_callback=on_progress,
+                file_filter=file_filter,
+            )
             self.image_count = get_image_index_count()
 
             self._set_progress(100, "Done")

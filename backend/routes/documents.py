@@ -81,6 +81,10 @@ async def download_mistral_ocr_markdown(file: str = Query(...)):
     )
 
 
+# Allowed extensions in the documents page; anything else (dotfiles, .DS_Store, .gitkeep, ...) is hidden.
+_LISTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp", ".md", ".txt", ".json"}
+
+
 @router.get("/api/documents")
 async def list_documents():
     from backend.services.rag_service import rag
@@ -89,14 +93,19 @@ async def list_documents():
         return {"files": []}
     files = []
     for f in sorted(os.listdir(uploads)):
+        if f.startswith("."):
+            continue
         path = os.path.join(uploads, f)
-        if os.path.isfile(path):
-            ext = os.path.splitext(f)[1].lower()
-            files.append({
-                "name": f,
-                "size": os.path.getsize(path),
-                "type": ext,
-            })
+        if not os.path.isfile(path):
+            continue
+        ext = os.path.splitext(f)[1].lower()
+        if ext not in _LISTED_EXTENSIONS:
+            continue
+        files.append({
+            "name": f,
+            "size": os.path.getsize(path),
+            "type": ext,
+        })
     return {"files": files}
 
 

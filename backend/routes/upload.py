@@ -5,7 +5,9 @@ from typing import List
 
 router = APIRouter()
 
-ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".md", ".txt", ".json"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp"}
+DOC_EXTENSIONS = {".pdf", ".md", ".txt", ".json"}
+ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | DOC_EXTENSIONS
 
 
 @router.post("/api/upload")
@@ -14,7 +16,9 @@ async def upload_files(files: List[UploadFile] = File(...)):
     uploads = rag.uploads_folder
     os.makedirs(uploads, exist_ok=True)
 
-    saved = []
+    saved: list[str] = []
+    images: list[str] = []
+    docs: list[str] = []
     for f in files:
         ext = os.path.splitext(f.filename or "")[1].lower()
         if ext not in ALLOWED_EXTENSIONS:
@@ -24,5 +28,16 @@ async def upload_files(files: List[UploadFile] = File(...)):
         with open(path, "wb") as out:
             out.write(content)
         saved.append(f.filename)
+        if ext in IMAGE_EXTENSIONS:
+            images.append(f.filename)
+        elif ext in DOC_EXTENSIONS:
+            docs.append(f.filename)
 
-    return {"uploaded": saved, "count": len(saved)}
+    return {
+        "uploaded": saved,
+        "count": len(saved),
+        "images": images,
+        "docs": docs,
+        "images_count": len(images),
+        "docs_count": len(docs),
+    }

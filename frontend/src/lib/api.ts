@@ -91,7 +91,16 @@ export async function deleteDocument(fileName: string): Promise<{ deleted: strin
   return res.json();
 }
 
-export async function uploadFiles(files: File[]): Promise<{ uploaded: string[]; count: number }> {
+export interface UploadResult {
+  uploaded: string[];
+  count: number;
+  images: string[];
+  docs: string[];
+  images_count: number;
+  docs_count: number;
+}
+
+export async function uploadFiles(files: File[]): Promise<UploadResult> {
   const form = new FormData();
   files.forEach((f) => form.append("files", f));
   const res = await fetch(`${API}/api/upload`, { method: "POST", body: form });
@@ -105,16 +114,31 @@ export async function triggerReindex(): Promise<{ status: string }> {
   return res.json();
 }
 
-export async function triggerReindexDocs(): Promise<{ status: string }> {
-  const res = await fetch(`${API}/api/index/docs`, { method: "POST" });
+export interface TriggerReindexResponse {
+  status: string;
+  targeted?: boolean;
+  count?: number;
+}
+
+async function postIndex(endpoint: string, files?: string[]): Promise<TriggerReindexResponse> {
+  const init: RequestInit = { method: "POST" };
+  if (files && files.length > 0) {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify({ files });
+  }
+  const res = await fetch(`${API}${endpoint}`, init);
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
-export async function triggerReindexImages(): Promise<{ status: string }> {
-  const res = await fetch(`${API}/api/index/images`, { method: "POST" });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json();
+/** Re-index documents. Pass `files` (basenames) to target only specific uploads. */
+export async function triggerReindexDocs(files?: string[]): Promise<TriggerReindexResponse> {
+  return postIndex("/api/index/docs", files);
+}
+
+/** Re-index images. Pass `files` (basenames) to target only specific uploads. */
+export async function triggerReindexImages(files?: string[]): Promise<TriggerReindexResponse> {
+  return postIndex("/api/index/images", files);
 }
 
 export async function getIndexInfo(): Promise<IndexInfo> {

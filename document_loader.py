@@ -1082,10 +1082,15 @@ def load_and_chunk_folder(
     vision_provider: str = "",
     vision_api_key: str = "",
     progress_callback: Optional[Callable[[int, str], None]] = None,
+    file_filter: set[str] | None = None,
 ) -> List[Chunk]:
     """
     Read supported files from folder, extract text (with OCR or Docling), chunk.
     Incremental: if existing_chunks provided and file mtime hasn't changed, skip extraction.
+
+    `file_filter` (set of basenames): when set, only these files are (re)processed.
+    All other files keep whatever cached chunks exist in `existing_chunks` (unchanged),
+    so the overall index is preserved but only the requested files are re-chunked.
     Returns list of Chunks with metadata.
     """
     folder = folder or DATA_FOLDER
@@ -1134,6 +1139,14 @@ def load_and_chunk_folder(
                     logger.debug("Skipping unchanged file: %s", base)
                     all_chunks.extend(cached)
                     continue
+
+            # Targeted indexing: if a file_filter is provided, anything NOT in it is
+            # preserved from the existing index (if cached) or skipped entirely.
+            # This lets the UI index only the files a user just uploaded.
+            if file_filter is not None and base not in file_filter:
+                if base in file_map:
+                    all_chunks.extend(file_map[base])
+                continue
 
             if progress_callback:
                 pct = min(55, 15 + processed_count * 4)

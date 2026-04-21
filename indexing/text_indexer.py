@@ -80,9 +80,14 @@ def build_text_index(
     vision_provider: str = "",
     vision_api_key: str = "",
     progress_callback: Optional[Callable[[int, str], None]] = None,
+    file_filter: Optional[set[str]] = None,
 ) -> SearchIndex:
     """
     Incremental build: load documents, chunk (skipping unchanged), and upsert to index.
+
+    `file_filter` (set of basenames): when provided, only those files are re-chunked;
+    cached chunks for other files are retained unchanged. This lets the UI index just
+    the files a user uploaded without touching the rest of the index.
     """
     data_folder = data_folder or DATA_FOLDER
     
@@ -100,6 +105,7 @@ def build_text_index(
         vision_provider=vision_provider,
         vision_api_key=vision_api_key,
         progress_callback=progress_callback,
+        file_filter=file_filter,
     )
     # 2b. Normalize patient names at index time (OCR variants -> canonical, no duplicates)
     normalize_patient_names_in_chunks(chunks)
