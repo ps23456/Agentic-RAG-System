@@ -1,6 +1,15 @@
 import type { ChatResponse, DocumentPage, FieldsExtractResponse, IndexInfo, ResultItem, Source, UploadedFile } from "./types";
 
 const API = "";
+const BACKEND_API_KEY = (import.meta.env.VITE_BACKEND_API_KEY as string | undefined)?.trim();
+
+function withAuthHeaders(headers?: HeadersInit): HeadersInit {
+  const merged = new Headers(headers ?? {});
+  if (BACKEND_API_KEY) {
+    merged.set("X-API-Key", BACKEND_API_KEY);
+  }
+  return merged;
+}
 
 export async function sendChat(
   query: string,
@@ -11,7 +20,7 @@ export async function sendChat(
 ): Promise<ChatResponse> {
   const res = await fetch(`${API}/api/chat`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: withAuthHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({
       query,
       patient_filter: patientFilter,
@@ -67,7 +76,7 @@ export async function sendChatStream(
 ): Promise<void> {
   const res = await fetch(`${API}/api/chat/stream`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: withAuthHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({
       query,
       patient_filter: opts?.patientFilter,
@@ -128,7 +137,7 @@ export async function evaluateChat(
 ): Promise<EvaluateResult> {
   const res = await fetch(`${API}/api/chat/evaluate`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: withAuthHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ query, summary, results }),
   });
   if (!res.ok) throw new Error(await res.text());
@@ -196,7 +205,7 @@ export async function listDocuments(): Promise<{ files: UploadedFile[] }> {
 export async function deleteDocument(fileName: string): Promise<{ deleted: string }> {
   const res = await fetch(
     `${API}/api/documents?file=${encodeURIComponent(fileName)}`,
-    { method: "DELETE" }
+    { method: "DELETE", headers: withAuthHeaders() }
   );
   if (!res.ok) throw new Error(await res.text());
   return res.json();
@@ -214,13 +223,17 @@ export interface UploadResult {
 export async function uploadFiles(files: File[]): Promise<UploadResult> {
   const form = new FormData();
   files.forEach((f) => form.append("files", f));
-  const res = await fetch(`${API}/api/upload`, { method: "POST", body: form });
+  const res = await fetch(`${API}/api/upload`, {
+    method: "POST",
+    headers: withAuthHeaders(),
+    body: form,
+  });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 export async function triggerReindex(): Promise<{ status: string }> {
-  const res = await fetch(`${API}/api/index`, { method: "POST" });
+  const res = await fetch(`${API}/api/index`, { method: "POST", headers: withAuthHeaders() });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -232,9 +245,9 @@ export interface TriggerReindexResponse {
 }
 
 async function postIndex(endpoint: string, files?: string[]): Promise<TriggerReindexResponse> {
-  const init: RequestInit = { method: "POST" };
+  const init: RequestInit = { method: "POST", headers: withAuthHeaders() };
   if (files && files.length > 0) {
-    init.headers = { "Content-Type": "application/json" };
+    init.headers = withAuthHeaders({ "Content-Type": "application/json" });
     init.body = JSON.stringify({ files });
   }
   const res = await fetch(`${API}${endpoint}`, init);
