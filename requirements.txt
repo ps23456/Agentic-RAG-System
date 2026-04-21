@@ -2,7 +2,6 @@
 # numpy<2 avoids "module compiled with NumPy 1.x" crash when importing torch
 numpy>=1.26.0,<2
 torch>=2.0.0
-streamlit>=1.28.0
 rank-bm25>=0.2.2
 sentence-transformers>=2.2.0
 transformers>=4.30.0

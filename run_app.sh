@@ -10,7 +10,7 @@ echo ""
 
 # Start backend
 cd "$DIR"
-"$DIR/.venv_bge/bin/python3.12" -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload &
+"$DIR/.venv_bge/bin/python3.12" -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 &
 BACKEND_PID=$!
 
 # Start frontend

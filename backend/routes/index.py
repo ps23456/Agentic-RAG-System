@@ -2,8 +2,9 @@
 import threading
 from typing import List, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
+from backend.security import require_api_key
 
 router = APIRouter()
 
@@ -26,7 +27,7 @@ def _normalize_filter(body: Optional[IndexRequest]) -> Optional[set[str]]:
 
 
 @router.post("/api/index")
-async def trigger_reindex():
+async def trigger_reindex(_auth: None = Depends(require_api_key)):
     """Re-index everything (docs + images)."""
     from backend.services.rag_service import rag
     if rag._indexing:
@@ -37,7 +38,10 @@ async def trigger_reindex():
 
 
 @router.post("/api/index/docs")
-async def trigger_reindex_docs(body: Optional[IndexRequest] = None):
+async def trigger_reindex_docs(
+    body: Optional[IndexRequest] = None,
+    _auth: None = Depends(require_api_key),
+):
     """Re-index documents only (text chunks + trees).
 
     Accepts optional JSON body: ``{ "files": ["foo.pdf", "bar.md"] }`` to index just
@@ -55,7 +59,10 @@ async def trigger_reindex_docs(body: Optional[IndexRequest] = None):
 
 
 @router.post("/api/index/images")
-async def trigger_reindex_images(body: Optional[IndexRequest] = None):
+async def trigger_reindex_images(
+    body: Optional[IndexRequest] = None,
+    _auth: None = Depends(require_api_key),
+):
     """Re-index images only.
 
     Accepts optional JSON body: ``{ "files": ["photo.png"] }`` to index just those

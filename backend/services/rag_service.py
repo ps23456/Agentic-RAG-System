@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import threading
+import time
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if PROJECT_ROOT not in sys.path:
@@ -80,6 +81,42 @@ class RAGService:
         except Exception:
             self.image_count = 0
 
+        # Warm the PDF page-text cache so the first chat query is fast. Without
+        # this, every cold query pays a multi-second cost to extract text from
+        # large PDFs (e.g. 560-page annual reports) via fitz.
+        try:
+            from indexing.page_tree import preload_pdf_pages
+            pdf_paths: list[str] = []
+            for root, _dirs, files in os.walk(self.data_folder):
+                for name in files:
+                    if name.lower().endswith(".pdf"):
+                        pdf_paths.append(os.path.join(root, name))
+            if pdf_paths:
+                threading.Thread(
+                    target=preload_pdf_pages,
+                    args=(pdf_paths,),
+                    daemon=True,
+                    name="pdf-page-preload",
+                ).start()
+        except Exception as e:
+            logger.debug("PDF page preload skipped: %s", e)
+
+        # Preload the BGE cross-encoder reranker on a background thread so the
+        # first chat query doesn't pay a ~4s cold-load penalty. The model
+        # download is a no-op after the first run (cached in ~/.cache).
+        def _warm_reranker() -> None:
+            try:
+                t0 = time.time()
+                from search_index import _load_reranker
+                _load_reranker()
+                logger.info("Reranker warmed in %.2fs", time.time() - t0)
+            except Exception as e:
+                logger.debug("Reranker warmup skipped: %s", e)
+
+        threading.Thread(
+            target=_warm_reranker, daemon=True, name="reranker-warmup",
+        ).start()
+
     def get_patients(self) -> list[str]:
         if not self.search_index or not hasattr(self.search_index, "chunks"):
             return []
@@ -90,9 +127,23 @@ class RAGService:
         except Exception:
             return []
 
-    def _direct_pdf_scan(self, query: str, top_k: int = 5, file_filter: str | None = None) -> list[tuple[str, int, str]]:
-        """Fallback: scan PDFs directly with fitz when tree may miss exact matches.
-        Returns [(file_name, page_number, page_text), ...] for pages containing the exact phrase."""
+    def _direct_pdf_scan(
+        self,
+        query: str,
+        top_k: int = 5,
+        file_filter: str | None = None,
+        allowed_files: set[str] | None = None,
+    ) -> list[tuple[str, int, str]]:
+        """Fallback: scan PDFs for pages containing the exact phrase.
+
+        Uses the shared page-text cache from indexing.page_tree so repeated
+        scans during a single chat turn (and across turns) are cheap.
+        `allowed_files` (when provided) further restricts the walk — only those
+        basenames are scanned. This lets patient-scoped or file-scoped queries
+        skip unrelated PDFs entirely instead of touching the whole corpus.
+        """
+        from indexing.page_tree import get_pdf_page_texts
+
         out = []
         q = (query or "").strip().lower()
         if len(q) < 10:
@@ -103,20 +154,15 @@ class RAGService:
                     continue
                 if file_filter and name != file_filter:
                     continue
+                if allowed_files is not None and name not in allowed_files:
+                    continue
                 path = os.path.join(root, name)
-                try:
-                    import fitz
-                    doc = fitz.open(path)
-                    for pg_idx in range(len(doc)):
-                        text = doc.load_page(pg_idx).get_text()
-                        if q in text.lower():
-                            out.append((name, pg_idx + 1, text[:2000]))
-                            if len(out) >= top_k:
-                                doc.close()
-                                return out
-                    doc.close()
-                except Exception as e:
-                    logger.debug("Direct PDF scan failed for %s: %s", name, e)
+                pages = get_pdf_page_texts(path)
+                for pg_idx, text in enumerate(pages):
+                    if q in text.lower():
+                        out.append((name, pg_idx + 1, text[:2000]))
+                        if len(out) >= top_k:
+                            return out
         return out
 
     def _merge_tree_and_rag(self, query: str, results: list[dict], file_filter: str | None = None) -> list[dict]:
@@ -134,17 +180,32 @@ class RAGService:
         except ImportError:
             pass
 
+        # Derive the allowed-file set from the incoming `results`. If the
+        # upstream agentic RAG already scoped to a patient's files, those are
+        # the only files represented here — we should NOT re-scan the whole
+        # corpus.
+        allowed_files: set[str] | None = None
+        if file_filter:
+            allowed_files = {file_filter}
+        elif results:
+            seen = {r.get("file_name", "") for r in results if r.get("file_name")}
+            if seen:
+                allowed_files = seen
+
         tree_hits = []
         if self.page_trees:
-            tree_hits = tree_keyword_retrieve(query, self.page_trees, self.data_folder, top_k=20)
-            if file_filter:
-                tree_hits = [(tc, sc) for tc, sc in tree_hits if tc.file_name == file_filter]
+            tree_hits = tree_keyword_retrieve(
+                query, self.page_trees, self.data_folder, top_k=20,
+                allowed_files=allowed_files,
+            )
 
         # Fallback: scan PDFs for exact phrase (skip for .md/.txt - they're in text index)
         q_lower = query.lower().strip()
         existing_tree_pages = {(tc.file_name, tc.page_number) for tc, _ in tree_hits}
         if len(q_lower) >= 10 and (not file_filter or (file_filter and file_filter.lower().endswith(".pdf"))):
-            for fname, pg, text in self._direct_pdf_scan(query, top_k=5, file_filter=file_filter):
+            for fname, pg, text in self._direct_pdf_scan(
+                query, top_k=5, file_filter=file_filter, allowed_files=allowed_files,
+            ):
                 if (fname, pg) not in existing_tree_pages:
                     from indexing.page_tree import TreeChunk
                     tc = TreeChunk(
@@ -215,19 +276,31 @@ class RAGService:
         results.sort(key=lambda x: x["score"], reverse=True)
         return results
 
-    def chat(self, query: str, patient_filter: str | None = None, web_search: bool = False, file_filter: str | None = None) -> dict:
-        """Run the full search pipeline and return structured results."""
+    def _build_chat_context(
+        self,
+        query: str,
+        patient_filter: str | None,
+        web_search: bool,
+        file_filter: str | None,
+    ) -> dict | None:
+        """Run the retrieval pipeline. Returns all data needed for summary generation.
+
+        Does NOT call the summary LLM. Shared by chat() (non-streaming, legacy)
+        and stream_chat() (SSE). Returns None when no index is loaded.
+        """
         from retrieval.agentic_rag import run_agentic_rag, get_robust_catalog
         from retrieval.text_retriever import TextRetriever
         from retrieval.image_retriever import ImageRetriever
-        from indexing.page_tree import generate_summary_from_results
 
         if not self.search_index:
-            return {"summary": "No documents indexed yet. Please upload files and reindex.", "sources": [], "results": []}
+            return None
 
+        t_all = time.time()
+        t0 = time.time()
         text_retriever = TextRetriever(self.search_index)
         image_retriever = ImageRetriever()
         catalog = get_robust_catalog(self.search_index.chunks)
+        logger.info("[chat-timing] init+catalog: %.2fs", time.time() - t0)
 
         user_meta = {}
         if patient_filter and patient_filter != "All":
@@ -238,6 +311,7 @@ class RAGService:
 
         llm_key, provider = self._llm_key_and_provider()
 
+        t0 = time.time()
         understanding, fused, direct_answer = run_agentic_rag(
             query,
             self.search_index,
@@ -251,12 +325,10 @@ class RAGService:
             page_trees=self.page_trees if self.page_trees else None,
             data_folder=self.data_folder,
         )
+        logger.info("[chat-timing] run_agentic_rag: %.2fs (fused=%d)", time.time() - t0, len(fused or []))
 
-        summary = ""
-        sources: list[dict] = []
-        results = []
+        results: list[dict] = []
         for r in (fused or [])[:25]:
-            # When Chat clicked on a specific doc, only keep results from that file
             if file_filter:
                 c = r.get("content")
                 fn = getattr(c, "file_name", "") if hasattr(c, "file_name") else (c or {}).get("file_name", "")
@@ -286,9 +358,10 @@ class RAGService:
                 })
 
         if self.page_trees:
+            t0 = time.time()
             results = self._merge_tree_and_rag(query, results)
+            logger.info("[chat-timing] merge_tree_and_rag: %.2fs", time.time() - t0)
 
-        # Build score_sources early so we can pass exact-phrase-prioritized items to summary
         q_lower = (query or "").strip().lower()
         exact_phrase_sources: list[dict] = []
         other_sources: list[dict] = []
@@ -312,7 +385,6 @@ class RAGService:
         if len(score_sources) > 8:
             score_sources = score_sources[:8]
 
-        # Build fused_map: (file_name, page) -> fused item for LLM; use score_sources order so PDF pages with exact match appear first
         fused_map: dict[tuple, dict] = {}
         for r in (fused or []):
             c = r.get("content")
@@ -325,14 +397,12 @@ class RAGService:
                 if key not in fused_map:
                     fused_map[key] = r
 
-        # Ordered fused items for summary: score_sources order (PDF exact phrase first) so citations match display
         ordered_fused: list[dict] = []
         for src in score_sources:
             key = (src["file_name"], src.get("page"))
             if key in fused_map:
                 ordered_fused.append(fused_map[key])
             else:
-                # Tree-only result: build synthetic fused item from results
                 res = next((x for x in results if (x.get("file_name"), x.get("page")) == key), None)
                 if res:
                     from types import SimpleNamespace
@@ -347,20 +417,13 @@ class RAGService:
                         "final_score": res.get("score", 0),
                     })
 
-        if ordered_fused:
-            try:
-                summary, sources = generate_summary_from_results(query, ordered_fused, llm_key, provider)
-            except Exception as e:
-                logger.warning("Summary generation failed: %s", e)
-                if direct_answer:
-                    summary = direct_answer
-
-        web_results: list[dict] = []
+        web_context = ""
         if web_search:
+            t0 = time.time()
             try:
                 from backend.services.web_search import web_search as do_web_search
                 web_hits = do_web_search(query, max_results=5)
-                web_context = ""
+                web_results: list[dict] = []
                 for i, wh in enumerate(web_hits):
                     web_results.append({
                         "type": "web",
@@ -373,45 +436,167 @@ class RAGService:
                         "url": wh.get("url", ""),
                     })
                     web_context += f"\n[Web: {wh.get('title', '')}] {wh.get('snippet', '')}"
-
-                # Prepend web results so they appear in sources chips and retrieved list
                 if web_results:
                     results = web_results + results
-
-                if web_context and summary:
-                    llm_key, prov = self._llm_key_and_provider()
-                    if llm_key:
-                        try:
-                            from retrieval.agentic_rag import _call_llm
-                            enhanced = _call_llm(
-                                f"You previously answered a query with document-based information. "
-                                f"Now incorporate relevant web search results into your answer. "
-                                f"Keep the existing answer structure but add web insights where helpful.\n\n"
-                                f"Query: {query}\n\nExisting answer:\n{summary}\n\n"
-                                f"Web results:\n{web_context}\n\n"
-                                f"Return the enhanced answer in markdown.",
-                                llm_key, prov,
-                            )
-                            if enhanced and len(enhanced) > 50:
-                                summary = enhanced
-                        except Exception as e:
-                            logger.warning("Web summary enhancement failed: %s", e)
             except Exception as e:
                 logger.warning("Web search integration failed: %s", e)
+            logger.info("[chat-timing] web_search: %.2fs", time.time() - t0)
 
-        if direct_answer and not summary:
-            summary = direct_answer
+        logger.info("[chat-timing] _build_chat_context total: %.2fs", time.time() - t_all)
+        return {
+            "llm_key": llm_key,
+            "provider": provider,
+            "understanding": understanding or {},
+            "direct_answer": direct_answer,
+            "ordered_fused": ordered_fused,
+            "score_sources": score_sources,
+            "results": results,
+            "web_context": web_context,
+        }
 
-        if not sources and score_sources:
-            sources = score_sources
+    def chat(self, query: str, patient_filter: str | None = None, web_search: bool = False, file_filter: str | None = None) -> dict:
+        """Run the full search pipeline and return structured results (non-streaming).
+
+        Kept for back-compat with `POST /api/chat`. New clients should use
+        `stream_chat` (SSE) for ChatGPT-like UX.
+        """
+        from indexing.page_tree import generate_summary_from_results
+
+        ctx = self._build_chat_context(query, patient_filter, web_search, file_filter)
+        if ctx is None:
+            return {"summary": "No documents indexed yet. Please upload files and reindex.", "sources": [], "results": []}
+
+        summary = ""
+        sources: list[dict] = []
+        if ctx["ordered_fused"]:
+            try:
+                summary, sources = generate_summary_from_results(
+                    query, ctx["ordered_fused"], ctx["llm_key"], ctx["provider"],
+                )
+            except Exception as e:
+                logger.warning("Summary generation failed: %s", e)
+                if ctx["direct_answer"]:
+                    summary = ctx["direct_answer"]
+
+        if ctx["web_context"] and summary and ctx["llm_key"]:
+            try:
+                from retrieval.agentic_rag import _call_llm
+                enhanced = _call_llm(
+                    f"You previously answered a query with document-based information. "
+                    f"Now incorporate relevant web search results into your answer. "
+                    f"Keep the existing answer structure but add web insights where helpful.\n\n"
+                    f"Query: {query}\n\nExisting answer:\n{summary}\n\n"
+                    f"Web results:\n{ctx['web_context']}\n\n"
+                    f"Return the enhanced answer in markdown.",
+                    ctx["llm_key"], ctx["provider"],
+                )
+                if enhanced and len(enhanced) > 50:
+                    summary = enhanced
+            except Exception as e:
+                logger.warning("Web summary enhancement failed: %s", e)
+
+        if ctx["direct_answer"] and not summary:
+            summary = ctx["direct_answer"]
+
+        if not sources and ctx["score_sources"]:
+            sources = ctx["score_sources"]
 
         return {
             "summary": summary,
             "sources": sources,
-            "results": results,
-            "intent": (understanding or {}).get("intent", ""),
-            "reasoning": (understanding or {}).get("reasoning", ""),
+            "results": ctx["results"],
+            "intent": ctx["understanding"].get("intent", ""),
+            "reasoning": ctx["understanding"].get("reasoning", ""),
         }
+
+    def stream_chat(
+        self,
+        query: str,
+        patient_filter: str | None = None,
+        web_search: bool = False,
+        file_filter: str | None = None,
+    ):
+        """Generator yielding SSE-friendly events for streaming chat.
+
+        Event kinds (each yielded as a (kind, data) tuple):
+          - ("status", dict) : lightweight progress ping — sent before any heavy
+                               work so the SSE connection opens in <200ms and
+                               the UI can show "Thinking..." immediately
+          - ("meta", dict)   : intent, reasoning, results, sources
+          - ("token", str)   : a chunk of the streaming summary
+          - ("done", dict)   : final {summary, sources, results, intent, reasoning}
+          - ("error", str)   : fatal error (sent in place of "done")
+        """
+        from indexing.page_tree import build_summary_prompt_and_sources
+        from retrieval.agentic_rag import _call_llm_stream
+
+        t_turn = time.time()
+        # Kick the stream immediately so the browser receives bytes and opens
+        # the SSE channel — without this the connection stays idle until
+        # retrieval finishes, which can look like the backend is hung.
+        yield ("status", {"stage": "retrieving"})
+
+        ctx = self._build_chat_context(query, patient_filter, web_search, file_filter)
+        if ctx is None:
+            msg = "No documents indexed yet. Please upload files and reindex."
+            yield ("meta", {"intent": "", "reasoning": "", "results": [], "sources": []})
+            yield ("token", msg)
+            yield ("done", {"summary": msg, "sources": [], "results": [], "intent": "", "reasoning": ""})
+            return
+
+        yield ("meta", {
+            "intent": ctx["understanding"].get("intent", ""),
+            "reasoning": ctx["understanding"].get("reasoning", ""),
+            "results": ctx["results"],
+            "sources": ctx["score_sources"],
+        })
+        yield ("status", {"stage": "generating"})
+
+        prompt, summary_sources = build_summary_prompt_and_sources(query, ctx["ordered_fused"])
+        if prompt and ctx["web_context"]:
+            prompt += (
+                "\n\nAdditional web search results to incorporate where helpful "
+                "(cite them inline as [web] if used):\n"
+                + ctx["web_context"]
+            )
+
+        summary = ""
+        t_stream = time.time()
+        first_token_logged = False
+        if prompt and ctx["llm_key"]:
+            try:
+                for delta in _call_llm_stream(prompt, ctx["llm_key"], ctx["provider"], max_tokens=2000):
+                    if not delta:
+                        continue
+                    if not first_token_logged:
+                        logger.info(
+                            "[chat-timing] first-token latency (retrieval + prompt + LLM TTFT): %.2fs",
+                            time.time() - t_turn,
+                        )
+                        first_token_logged = True
+                    summary += delta
+                    yield ("token", delta)
+            except Exception as e:
+                logger.warning("Summary streaming failed: %s", e)
+
+        if not summary and ctx["direct_answer"]:
+            summary = ctx["direct_answer"]
+            yield ("token", summary)
+
+        final_sources = summary_sources if summary_sources else ctx["score_sources"]
+
+        logger.info(
+            "[chat-timing] summary stream: %.2fs | total turn: %.2fs | chars=%d",
+            time.time() - t_stream, time.time() - t_turn, len(summary),
+        )
+
+        yield ("done", {
+            "summary": summary,
+            "sources": final_sources,
+            "results": ctx["results"],
+            "intent": ctx["understanding"].get("intent", ""),
+            "reasoning": ctx["understanding"].get("reasoning", ""),
+        })
 
     def _set_progress(self, percent: int, stage: str):
         self._index_progress = min(100, max(0, percent))

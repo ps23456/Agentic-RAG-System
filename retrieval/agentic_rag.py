@@ -455,6 +455,83 @@ def _call_llm(prompt: str, api_key: str, provider: str) -> str | None:
     return None
 
 
+def _call_llm_stream(prompt: str, api_key: str, provider: str, max_tokens: int = 2000):
+    """Stream LLM tokens for Groq and OpenAI. Yields str deltas.
+
+    Gemini and other providers: yields the full response once (non-streaming fallback).
+    On any error, silently falls back to the non-streaming `_call_llm`.
+    """
+    provider = (provider or "").strip().lower() or "groq"
+    try:
+        if provider == "groq":
+            from groq import Groq
+            client = Groq(api_key=api_key)
+            stream = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=min(max_tokens, 4096),
+                temperature=0.1,
+                stream=True,
+            )
+            for chunk in stream:
+                try:
+                    delta = chunk.choices[0].delta.content if chunk.choices else None
+                except Exception:
+                    delta = None
+                if delta:
+                    yield delta
+            return
+        if provider == "openai":
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key)
+            stream = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=0.1,
+                stream=True,
+            )
+            for chunk in stream:
+                try:
+                    delta = chunk.choices[0].delta.content if chunk.choices else None
+                except Exception:
+                    delta = None
+                if delta:
+                    yield delta
+            return
+    except Exception as e:
+        # Groq rate-limit fallback: stream from OpenAI instead.
+        if provider == "groq" and _is_groq_limit_error(e):
+            openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+            if openai_key:
+                try:
+                    from openai import OpenAI
+                    client = OpenAI(api_key=openai_key)
+                    stream = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=max_tokens,
+                        temperature=0.1,
+                        stream=True,
+                    )
+                    for chunk in stream:
+                        try:
+                            delta = chunk.choices[0].delta.content if chunk.choices else None
+                        except Exception:
+                            delta = None
+                        if delta:
+                            yield delta
+                    return
+                except Exception as fb_err:
+                    logger.warning("OpenAI streaming fallback failed: %s", fb_err)
+        logger.warning("Streaming LLM call failed (%s); falling back to non-streaming: %s", provider, e)
+
+    # Final fallback: one-shot non-streaming.
+    out = _call_llm(prompt, api_key, provider)
+    if out:
+        yield out
+
+
 def _parse_llm_plan(raw: str | None) -> dict | None:
     """Parse the LLM's JSON response into a retrieval plan."""
     if not raw:
@@ -669,37 +746,77 @@ def _multi_query_retrieve(
     retrieve_k: int,
     boost_ocr: bool = False,
     main_intent_keywords: list[str] | None = None,
+    rerank_query: str | None = None,
 ) -> tuple[list, list]:
     """
-    Run multiple search queries and merge results.
-    Uses main_intent_keywords as additional queries so document-style phrasing
-    (e.g. "unhedged foreign currency exposure") finds the right chunk even when
-    user says "forex exposure not hedged". Dynamic, no hardcoding.
-    boost_ocr: when True (text-heavy queries), images with exact query words in OCR rank higher.
+    Run multiple search queries, merge their candidates, then rerank ONCE.
+
+    Previous behaviour reranked per-query (3 queries × 80 candidates = 240 CPU
+    cross-encoder scorings, ~30s on CPU). We now:
+      1. Gather BM25+vector RRF hybrid hits from each query (no rerank per query).
+      2. Deduplicate across queries, keeping the max hybrid score per chunk.
+      3. Rerank the UNION a single time against `rerank_query` (the user's
+         original question) so scores are consistent across all candidates.
+      4. If the deduped union is small (<= RERANKER_MIN_CANDIDATES), skip the
+         cross-encoder — RRF ordering is already a strong signal for small
+         pools (typical for patient-scoped queries).
     """
-    # Cap queries for speed (2 agent + 1 intent keyword = 3 max)
+    from config import RERANKER_CANDIDATES, RERANKER_MIN_CANDIDATES, STRUCTURED_SKIP_RERANKER
+
     queries = _expand_queries_with_intent_keywords(
         search_queries[:2], main_intent_keywords, max_extra=1
     )
-    all_text = {}
-    all_image = {}
+    rerank_q = (rerank_query or (search_queries[0] if search_queries else "")).strip()
 
+    all_text: dict[str, tuple[Any, float]] = {}
+    all_image: dict[tuple[str, Any], tuple[dict, float]] = {}
+
+    # Step 1: gather hybrid candidates (no rerank) from every query variant.
     for sq in queries:
-        text_hits = text_retriever.retrieve(sq, top_k=retrieve_k, metadata_filter=metadata_filter)
-        for chunk, score in text_hits:
-            cid = chunk.chunk_id
+        hybrid_hits = index.hybrid_search(
+            sq, top_k=RERANKER_CANDIDATES, fusion="rrf", metadata_filter=metadata_filter,
+        ) if hasattr(index, "hybrid_search") else []
+        for chunk, score in hybrid_hits:
+            cid = getattr(chunk, "chunk_id", None)
+            if cid is None:
+                continue
             if cid not in all_text or score > all_text[cid][1]:
                 all_text[cid] = (chunk, score)
 
-        image_hits = image_retriever.retrieve(sq, top_n=20, metadata_filter=metadata_filter, boost_ocr=boost_ocr)
+        image_hits = image_retriever.retrieve(
+            sq, top_n=20, metadata_filter=metadata_filter, boost_ocr=boost_ocr,
+        )
         for item, score in image_hits:
             key = (item.get("file_name", ""), item.get("page", ""))
             if key not in all_image or score > all_image[key][1]:
                 all_image[key] = (item, score)
 
-    text_results = sorted(all_text.values(), key=lambda x: x[1], reverse=True)
-    image_results = sorted(all_image.values(), key=lambda x: x[1], reverse=True)
+    # Cap union size for rerank, preferring highest RRF scores.
+    union = sorted(all_text.values(), key=lambda x: x[1], reverse=True)
+    union = union[:RERANKER_CANDIDATES]
 
+    # Step 2: single rerank pass against the user's original question — unless
+    # the pool is already small (fast path) or contains mostly structured docs
+    # (structured-doc skip is honored to match text_retriever behaviour).
+    text_results: list[tuple[Any, float]]
+    skip_rerank = (
+        len(union) <= RERANKER_MIN_CANDIDATES
+        or not rerank_q
+        or (STRUCTURED_SKIP_RERANKER and union and sum(
+            1 for c, _ in union if getattr(c, "doc_quality", "") == "structured"
+        ) > len(union) / 2)
+    )
+    if skip_rerank or not hasattr(index, "rerank"):
+        text_results = union
+    else:
+        try:
+            text_results = index.rerank(
+                rerank_q, union, top_k=retrieve_k, prioritize_exact_phrase=True,
+            )
+        except Exception:
+            text_results = union
+
+    image_results = sorted(all_image.values(), key=lambda x: x[1], reverse=True)
     return text_results[:retrieve_k], image_results[:20]
 
 
@@ -928,6 +1045,7 @@ def run_agentic_rag(
             retrieve_k=retrieve_k,
             boost_ocr=(query_type == "text_heavy"),
             main_intent_keywords=main_intent_keywords,
+            rerank_query=query,
         )
 
         # If patient metadata filtering returns context that is semantically off-topic
@@ -970,6 +1088,7 @@ def run_agentic_rag(
                     retrieve_k=retrieve_k,
                     boost_ocr=(query_type == "text_heavy"),
                     main_intent_keywords=main_intent_keywords,
+                    rerank_query=query,
                 )
                 seen_ids = {c.chunk_id for c, _ in text_results}
                 for c, s in backoff_text:
@@ -986,21 +1105,24 @@ def run_agentic_rag(
 
         if page_trees:
             from indexing.page_tree import tree_keyword_retrieve
-            tree_hits = tree_keyword_retrieve(query, page_trees, data_folder, top_k=25)
-            # When Chat clicked on a specific doc, restrict to that file only
+            # Compute the allowed-file set BEFORE scanning so unrelated trees
+            # are never opened. For a query like "Alyson Jude's activity
+            # restrictions" this means only her files are scanned.
             target_file = (metadata_filter or {}).get("file_name")
+            allowed_files: set[str] | None = None
             if target_file:
-                tree_hits = [(tc, sc) for tc, sc in tree_hits if tc.file_name == target_file]
+                allowed_files = {target_file}
             elif active_patients and index and getattr(index, "chunks", None):
-                # Tree hits have no patient metadata; restrict by files known to belong
-                # to the active patient(s) to avoid cross-document leakage.
                 allowed_files = {
                     getattr(c, "file_name", "")
                     for c in index.chunks
                     if (getattr(c, "patient_name", "") or "").strip().lower() in active_patients
                 }
-                if allowed_files:
-                    tree_hits = [(tc, sc) for tc, sc in tree_hits if tc.file_name in allowed_files]
+                allowed_files = {f for f in allowed_files if f} or None
+            tree_hits = tree_keyword_retrieve(
+                query, page_trees, data_folder, top_k=25,
+                allowed_files=allowed_files,
+            )
             q_lower = (query or "").strip().lower()
             # Prioritize tree hits with EXACT phrase match (e.g. "Concentration of Funding Sources")
             # so PDF page 381 ranks above irrelevant pages 384, 107, etc.
@@ -1067,6 +1189,7 @@ def run_agentic_rag(
             metadata_filter=metadata_filter or None, retrieve_k=retrieve_k,
             boost_ocr=(query_type == "text_heavy"),
             main_intent_keywords=main_intent_keywords,
+            rerank_query=query,
         )
         if index and hasattr(index, "verbatim_search"):
             v_fb = index.verbatim_search(query, metadata_filter or None, max_results=10)

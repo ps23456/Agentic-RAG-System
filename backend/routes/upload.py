@@ -1,7 +1,9 @@
 """File upload endpoint."""
 import os
 from fastapi import APIRouter, UploadFile, File
+from fastapi import Depends
 from typing import List
+from backend.security import require_api_key
 
 router = APIRouter()
 
@@ -11,7 +13,10 @@ ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | DOC_EXTENSIONS
 
 
 @router.post("/api/upload")
-async def upload_files(files: List[UploadFile] = File(...)):
+async def upload_files(
+    files: List[UploadFile] = File(...),
+    _auth: None = Depends(require_api_key),
+):
     from backend.services.rag_service import rag
     uploads = rag.uploads_folder
     os.makedirs(uploads, exist_ok=True)

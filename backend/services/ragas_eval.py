@@ -95,7 +95,11 @@ def _run_evaluate_once(
     from ragas.llms import llm_factory
     from ragas.metrics import answer_relevancy, faithfulness
 
-    llm = llm_factory(model_name, client=client)
+    # Default max_tokens in llm_factory is 1024. Ragas faithfulness keeps
+    # producing the "statements" JSON until it hits the cap, then
+    # InstructorRetryException fires 3x — wasting ~1–2 minutes per attempt.
+    # Bump to 4096 so the response fits in a single call.
+    llm = llm_factory(model_name, client=client, max_tokens=4096)
     result = evaluate(
         ds,
         metrics=[faithfulness, answer_relevancy],

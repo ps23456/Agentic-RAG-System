@@ -5,8 +5,9 @@ import os
 import re
 from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
+from backend.security import require_api_key
 
 # Devanagari Unicode block U+0900 to U+097F
 _DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
@@ -35,7 +36,10 @@ def _find_file(file_name: str) -> str | None:
 
 
 @router.delete("/api/documents")
-async def delete_document(file: str = Query(...)):
+async def delete_document(
+    file: str = Query(...),
+    _auth: None = Depends(require_api_key),
+):
     """Delete an uploaded document by filename."""
     from backend.services.rag_service import rag
     if ".." in file or "/" in file or "\\" in file:

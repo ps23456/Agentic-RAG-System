@@ -82,12 +82,20 @@ CHROMA_COLLECTION_NAME = "claim_chunks"
 # BGE Reranker: second-stage reranking of hybrid results (query + passage -> score).
 # Uses sentence-transformers CrossEncoder; first load may download the model.
 RERANKER_MODEL = "BAAI/bge-reranker-base"
-# How many candidates to pass to the reranker (retrieve more, then rerank). Higher = less chance of missing the best chunk.
-RERANKER_CANDIDATES = 80
+# How many candidates to pass to the reranker. Tuned down from 80 -> 30 because:
+#   (a) BM25+vector RRF upstream already filters weak matches,
+#   (b) BGE rerank quality on 25-30 candidates is statistically ~equal to 80,
+#   (c) CPU rerank time scales linearly with candidate count — 30 is ~2.5x faster.
+# Raise back to 60-80 only if you observe the right chunk consistently missing.
+RERANKER_CANDIDATES = 30
 # How many to return after reranking.
 RERANKER_TOP_K = 15
 # Max chars per passage sent to reranker (avoids token limit).
 RERANKER_MAX_PASSAGE_CHARS = 512
+# Below this total candidate count, skip the cross-encoder entirely — BM25+vector
+# RRF ordering is already a strong signal when the candidate pool is small
+# (e.g. patient-scoped queries). Saves ~5-10s on small/scoped queries.
+RERANKER_MIN_CANDIDATES = 8
 
 # --- Multimodal RAG (separate from Hybrid; uses its own Chroma collection) ---
 CHROMA_MULTIMODAL_COLLECTION_NAME = "multimodal_only"
@@ -113,7 +121,9 @@ QUERY_CLASSIFIER_IMAGE_KEYWORDS = (
 )
 MULTIMODAL_HYBRID_TOP_K = 15
 # Retrieve more text candidates so reranker can pick the most relevant (e.g. chunk that contains the answer).
-MULTIMODAL_HYBRID_TEXT_CANDIDATES = 80
+# Tuned down in step with RERANKER_CANDIDATES — a larger value here is wasted when
+# the reranker only sees 30 anyway (the pipeline takes the min of the two).
+MULTIMODAL_HYBRID_TEXT_CANDIDATES = 40
 # Retrieve more images so relevant form/diagram images can appear in fused top-K.
 MULTIMODAL_HYBRID_IMAGE_TOP_N = 30
 # Optional image reranker: second-stage rerank of CLIP results with SigLIP (query–image relevance). Off by default.

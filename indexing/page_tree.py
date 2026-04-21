@@ -10,10 +10,13 @@ Follows the approach from https://github.com/VectifyAI/PageIndex:
 3. Convert flat list (with "structure" field like 1, 1.1, 1.2) into nested tree
 4. Tree search: LLM navigates tree → drills into sections → extracts page text
 """
+import concurrent.futures
 import json
 import logging
 import os
 import re
+import threading
+import time as _time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, List, Optional
@@ -21,6 +24,70 @@ from typing import Any, Callable, List, Optional
 from config import DATA_FOLDER, PAGE_TREE_CACHE_DIR, PAGE_TREE_MAX_PAGES_PER_LLM, PAGE_TREE_TOC_PAGES, PAGE_TREE_MAX_PAGES_PER_NODE
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# PDF page-text cache
+# ---------------------------------------------------------------------------
+# Opening a PDF and extracting every page with fitz is expensive — for a
+# 560-page file it takes several seconds. The retrieval pipeline used to do
+# this THREE times per query (tree_keyword_retrieve, _merge_tree_and_rag, and
+# _direct_pdf_scan), which was the main source of the multi-minute "thinking"
+# time. We now cache the extracted texts keyed by (absolute_path, mtime) so
+# repeat scans are instant. The cache can be warmed at server startup via
+# `preload_pdf_pages` so even the first query is fast.
+_PDF_PAGES_CACHE: dict[tuple[str, float], list[str]] = {}
+_PDF_CACHE_LOCK = threading.Lock()
+
+
+def get_pdf_page_texts(path: str) -> list[str]:
+    """Return plain text for every page of a PDF, using a process-wide cache.
+
+    The cache key includes the file's mtime so the cache invalidates
+    automatically when the file is re-uploaded. Failures return an empty list
+    but are NOT cached, so transient I/O errors self-heal on retry.
+    """
+    if not path:
+        return []
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return []
+    key = (os.path.abspath(path), mtime)
+    with _PDF_CACHE_LOCK:
+        cached = _PDF_PAGES_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        import fitz
+        doc = fitz.open(path)
+        pages = [doc.load_page(i).get_text() for i in range(len(doc))]
+        doc.close()
+    except Exception as e:
+        logger.warning("PDF text extract failed for %s: %s", path, e)
+        return []
+    with _PDF_CACHE_LOCK:
+        _PDF_PAGES_CACHE[key] = pages
+    return pages
+
+
+def preload_pdf_pages(paths: list[str], max_workers: int = 4) -> None:
+    """Warm the PDF page-text cache in parallel.
+
+    Called once at server startup so the first user query does not pay the
+    cold-read cost for large PDFs (e.g. annual reports). Fitz releases the GIL
+    during page extraction, so a thread pool gives a near-linear speedup.
+    """
+    paths = [p for p in (paths or []) if p and os.path.isfile(p)]
+    if not paths:
+        return
+    t0 = _time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        list(ex.map(get_pdf_page_texts, paths))
+    logger.info(
+        "Preloaded %d PDF(s) into page-text cache in %.2fs",
+        len(paths), _time.time() - t0,
+    )
 
 
 @dataclass
@@ -866,11 +933,17 @@ def tree_keyword_retrieve(
     trees: List[dict],
     data_folder: str | None = None,
     top_k: int = 15,
+    allowed_files: set[str] | None = None,
 ) -> list[tuple["TreeChunk", float]]:
     """
     Fast, LLM-free keyword retrieval from tree-indexed PDFs.
     Uses fitz to scan pages for query terms and returns (TreeChunk, score) pairs
     compatible with text_results in the agentic RAG fusion pipeline.
+
+    `allowed_files`: when provided (e.g. the patient's known files, or the
+    single file the user clicked on), unrelated trees are skipped *before* the
+    expensive page scan. This is a major speed win for targeted queries like
+    "Alyson Jude's activity restrictions" — only her files are touched.
     """
     if not trees:
         return []
@@ -883,30 +956,28 @@ def tree_keyword_retrieve(
     max_raw_score = 1  # track for normalization
 
     for tree in trees:
+        # Upfront scoping: skip trees not in the allowed set before any I/O.
+        if allowed_files is not None and tree.get("file_name", "") not in allowed_files:
+            continue
         file_path = _resolve_pdf_path(tree, data_folder)
         if not file_path:
             continue
-        try:
-            import fitz
-            doc = fitz.open(file_path)
-            page_scores: list[tuple[int, str, int]] = []
-            for pg_idx in range(len(doc)):
-                text = doc.load_page(pg_idx).get_text()
-                text_lower = text.lower()
-                score = 0
-                if q_lower in text_lower:
-                    score += 10
-                for w in q_words:
-                    if w in text_lower:
-                        score += 1
-                if score > 0:
-                    page_scores.append((pg_idx + 1, text, score))
-                    if score > max_raw_score:
-                        max_raw_score = score
-            doc.close()
-        except Exception as e:
-            logger.warning("tree_keyword_retrieve scan failed for %s: %s", file_path, e)
+        pages = get_pdf_page_texts(file_path)
+        if not pages:
             continue
+        page_scores: list[tuple[int, str, int]] = []
+        for pg_idx, text in enumerate(pages):
+            text_lower = text.lower()
+            score = 0
+            if q_lower in text_lower:
+                score += 10
+            for w in q_words:
+                if w in text_lower:
+                    score += 1
+            if score > 0:
+                page_scores.append((pg_idx + 1, text, score))
+                if score > max_raw_score:
+                    max_raw_score = score
 
         page_scores.sort(key=lambda x: -x[2])
 
@@ -933,16 +1004,14 @@ def tree_keyword_retrieve(
     return all_hits[:top_k]
 
 
-def generate_summary_from_results(
+def build_summary_prompt_and_sources(
     query: str,
     fused_results: list[dict],
-    api_key: str,
-    provider: str = "openai",
 ) -> tuple[str, list[dict]]:
-    """
-    Generate a PageIndex-style markdown summary from fused results (post-fusion).
-    Handles both text chunks (Chunk/TreeChunk objects) and image results (dicts).
-    Returns (summary_markdown, source_citations).
+    """Build the summary LLM prompt and the ordered citation sources.
+
+    Pure function — no LLM call. Used by both the streaming and non-streaming
+    summary helpers so the UI can show citation chips before tokens arrive.
     """
     top_items = fused_results[:8]
     if not top_items:
@@ -1042,8 +1111,44 @@ INSTRUCTIONS:
 - CRITICAL: Add citation markers at the end of sentences or facts that come from a source. Use [1], [2], [3], etc. to match the source numbers above. Example: "Shri D. Surendran holds an MBA [1]." For facts from multiple sources use [1,2]. Add citations so users can verify every claim.
 - Be concise but comprehensive"""
 
+    return prompt, sources
+
+
+def generate_summary_from_results(
+    query: str,
+    fused_results: list[dict],
+    api_key: str,
+    provider: str = "openai",
+) -> tuple[str, list[dict]]:
+    """Generate a PageIndex-style markdown summary from fused results.
+
+    Non-streaming path (used by legacy `/api/chat`).
+    """
+    prompt, sources = build_summary_prompt_and_sources(query, fused_results)
+    if not prompt:
+        return "", []
     summary = _call_llm_tree(prompt, api_key, provider, max_tokens=2000) or ""
     return summary, sources
+
+
+def stream_summary_from_results(
+    query: str,
+    fused_results: list[dict],
+    api_key: str,
+    provider: str = "openai",
+):
+    """Stream summary tokens. Yields str deltas; caller accumulates the final text.
+
+    Sources are already known before streaming; get them from
+    `build_summary_prompt_and_sources` first if the UI needs them up front.
+    """
+    prompt, _ = build_summary_prompt_and_sources(query, fused_results)
+    if not prompt:
+        return
+    from retrieval.agentic_rag import _call_llm_stream
+    for delta in _call_llm_stream(prompt, api_key, provider, max_tokens=2000):
+        if delta:
+            yield delta
 
 
 def tree_search(
