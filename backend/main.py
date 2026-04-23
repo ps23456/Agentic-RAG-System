@@ -179,6 +179,7 @@ from backend.routes.upload import router as upload_router
 from backend.routes.index import router as index_router
 from backend.routes.medical import router as medical_router
 from backend.routes.fields import router as fields_router
+from backend.routes.query import router as query_router
 from backend.security import require_api_key
 app.include_router(chat_router)
 app.include_router(documents_router)
@@ -186,6 +187,7 @@ app.include_router(upload_router)
 app.include_router(index_router)
 app.include_router(medical_router)
 app.include_router(fields_router)
+app.include_router(query_router)
 
 
 @app.get("/api/health")
