@@ -127,6 +127,37 @@ class RAGService:
         except Exception:
             return []
 
+    def _infer_scope_from_query(self, query: str, catalog: dict) -> tuple[str | None, str | None]:
+        """Infer patient/file scope from natural-language query.
+
+        This keeps quality intact (same retrieval/reranking) while reducing
+        latency by avoiding unrelated files when user intent is clearly scoped.
+        """
+        q = (query or "").strip()
+        if not q:
+            return None, None
+        q_lower = q.lower()
+
+        inferred_file: str | None = None
+        try:
+            from retrieval.agentic_rag import _extract_query_filename
+            inferred_file = _extract_query_filename(q)
+        except Exception:
+            inferred_file = None
+
+        inferred_patient: str | None = None
+        for p in catalog.get("known_patients", []) or []:
+            p_low = p.lower()
+            if p_low in q_lower:
+                inferred_patient = p
+                break
+            # Handle possessive and punctuation variants: "Alyson Jude's"
+            if p_low.replace(" ", "") in q_lower.replace(" ", ""):
+                inferred_patient = p
+                break
+
+        return inferred_patient, inferred_file
+
     def _direct_pdf_scan(
         self,
         query: str,
@@ -302,12 +333,27 @@ class RAGService:
         catalog = get_robust_catalog(self.search_index.chunks)
         logger.info("[chat-timing] init+catalog: %.2fs", time.time() - t0)
 
+        effective_patient_filter = patient_filter
+        effective_file_filter = file_filter
+        if (not effective_patient_filter or effective_patient_filter == "All") or not effective_file_filter:
+            inferred_patient, inferred_file = self._infer_scope_from_query(query, catalog)
+            if (not effective_patient_filter or effective_patient_filter == "All") and inferred_patient:
+                effective_patient_filter = inferred_patient
+            if not effective_file_filter and inferred_file:
+                effective_file_filter = inferred_file
+            if inferred_patient or inferred_file:
+                logger.info(
+                    "[chat-scope] inferred patient=%s file=%s",
+                    inferred_patient or "-",
+                    inferred_file or "-",
+                )
+
         user_meta = {}
-        if patient_filter and patient_filter != "All":
+        if effective_patient_filter and effective_patient_filter != "All":
             aliases = catalog.get("patient_name_aliases", {})
-            user_meta["patient_name"] = aliases.get(patient_filter, [patient_filter])
-        if file_filter:
-            user_meta["file_name"] = file_filter
+            user_meta["patient_name"] = aliases.get(effective_patient_filter, [effective_patient_filter])
+        if effective_file_filter:
+            user_meta["file_name"] = effective_file_filter
 
         llm_key, provider = self._llm_key_and_provider()
 
@@ -329,10 +375,10 @@ class RAGService:
 
         results: list[dict] = []
         for r in (fused or [])[:25]:
-            if file_filter:
+            if effective_file_filter:
                 c = r.get("content")
                 fn = getattr(c, "file_name", "") if hasattr(c, "file_name") else (c or {}).get("file_name", "")
-                if fn != file_filter:
+                if fn != effective_file_filter:
                     continue
             content = r["content"]
             if r["type"] == "text":
@@ -359,7 +405,7 @@ class RAGService:
 
         if self.page_trees:
             t0 = time.time()
-            results = self._merge_tree_and_rag(query, results)
+            results = self._merge_tree_and_rag(query, results, file_filter=effective_file_filter)
             logger.info("[chat-timing] merge_tree_and_rag: %.2fs", time.time() - t0)
 
         q_lower = (query or "").strip().lower()
@@ -452,6 +498,12 @@ class RAGService:
             "score_sources": score_sources,
             "results": results,
             "web_context": web_context,
+            "effective_patient_filter": effective_patient_filter,
+            "effective_file_filter": effective_file_filter,
+            "is_scoped": bool(
+                (effective_patient_filter and effective_patient_filter != "All")
+                or effective_file_filter
+            ),
         }
 
     def chat(self, query: str, patient_filter: str | None = None, web_search: bool = False, file_filter: str | None = None) -> dict:
@@ -472,6 +524,7 @@ class RAGService:
             try:
                 summary, sources = generate_summary_from_results(
                     query, ctx["ordered_fused"], ctx["llm_key"], ctx["provider"],
+                    max_tokens=1200 if ctx.get("is_scoped") else 2000,
                 )
             except Exception as e:
                 logger.warning("Summary generation failed: %s", e)
@@ -565,7 +618,10 @@ class RAGService:
         first_token_logged = False
         if prompt and ctx["llm_key"]:
             try:
-                for delta in _call_llm_stream(prompt, ctx["llm_key"], ctx["provider"], max_tokens=2000):
+                max_summary_tokens = 1200 if ctx.get("is_scoped") else 2000
+                for delta in _call_llm_stream(
+                    prompt, ctx["llm_key"], ctx["provider"], max_tokens=max_summary_tokens
+                ):
                     if not delta:
                         continue
                     if not first_token_logged:

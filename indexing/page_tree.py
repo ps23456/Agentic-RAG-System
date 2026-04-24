@@ -1119,6 +1119,7 @@ def generate_summary_from_results(
     fused_results: list[dict],
     api_key: str,
     provider: str = "openai",
+    max_tokens: int = 2000,
 ) -> tuple[str, list[dict]]:
     """Generate a PageIndex-style markdown summary from fused results.
 
@@ -1127,7 +1128,7 @@ def generate_summary_from_results(
     prompt, sources = build_summary_prompt_and_sources(query, fused_results)
     if not prompt:
         return "", []
-    summary = _call_llm_tree(prompt, api_key, provider, max_tokens=2000) or ""
+    summary = _call_llm_tree(prompt, api_key, provider, max_tokens=max_tokens) or ""
     return summary, sources
 
 
