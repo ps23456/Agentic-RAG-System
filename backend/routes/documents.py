@@ -1,5 +1,6 @@
 """Document serving: list files, render PDF pages, serve text/images."""
 import base64
+import json
 import io
 import os
 import re
@@ -7,7 +8,8 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
-from backend.security import require_api_key
+from backend.db.tenant_store import tenant_store
+from backend.security import require_scopes
 
 # Devanagari Unicode block U+0900 to U+097F
 _DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
@@ -35,39 +37,132 @@ def _find_file(file_name: str) -> str | None:
     return None
 
 
+def _require_owned_document(auth, file_name: str, customer_id: str | None = None) -> None:
+    if not tenant_store.has_document_access(auth.tenant_id, auth.user_id, file_name, customer_id=customer_id):
+        raise HTTPException(404, f"File not found: {file_name}")
+
+
+def _owned_path(auth, file_name: str, customer_id: str | None = None) -> str:
+    row = tenant_store.get_document_for_owner(auth.tenant_id, auth.user_id, file_name, customer_id=customer_id)
+    if row and row.get("storage_uri"):
+        p = row["storage_uri"]
+        if os.path.isfile(p):
+            return p
+    # Backward-compat fallback for older rows without storage URI.
+    path = _find_file(file_name)
+    if not path:
+        raise HTTPException(404, f"File not found: {file_name}")
+    return path
+
+
+def _resolve_doc(auth, file_name: str | None, doc_id: str | None, customer_id: str | None) -> dict:
+    if doc_id:
+        row = tenant_store.get_document_by_id_for_owner(
+            auth.tenant_id,
+            auth.user_id,
+            doc_id=doc_id,
+            customer_id=customer_id,
+        )
+        if not row:
+            raise HTTPException(404, f"Document not found: {doc_id}")
+        return row
+    if not file_name:
+        raise HTTPException(400, "Provide either file or doc_id")
+    row = tenant_store.get_document_for_owner(
+        auth.tenant_id,
+        auth.user_id,
+        file_name=file_name,
+        customer_id=customer_id,
+    )
+    if not row:
+        raise HTTPException(404, f"File not found: {file_name}")
+    return row
+
+
 @router.delete("/api/documents")
 async def delete_document(
-    file: str = Query(...),
-    _auth: None = Depends(require_api_key),
+    file: str = Query(""),
+    doc_id: str = Query(""),
+    customer_id: str = Query(""),
+    auth=Depends(require_scopes("docs:write")),
 ):
     """Delete an uploaded document by filename."""
-    from backend.services.rag_service import rag
-    if ".." in file or "/" in file or "\\" in file:
+    if file and (".." in file or "/" in file or "\\" in file):
         raise HTTPException(400, "Invalid filename")
-    uploads = rag.uploads_folder
-    path = os.path.join(uploads, file)
+    cid = customer_id.strip() or None
+    row = _resolve_doc(auth, (file or None), (doc_id.strip() or None), cid)
+    path = row.get("storage_uri") or _owned_path(auth, row["file_name"], customer_id=cid)
     if not os.path.isfile(path):
-        raise HTTPException(404, f"File not found: {file}")
+        raise HTTPException(404, "File not found")
     try:
         os.remove(path)
-        return {"deleted": file}
+        # Best-effort empty directory cleanup for doc_id storage layout.
+        removed_dirs = 0
+        parent = os.path.dirname(path)
+        for _ in range(3):
+            if not parent:
+                break
+            try:
+                os.rmdir(parent)
+                removed_dirs += 1
+                parent = os.path.dirname(parent)
+            except OSError:
+                break
+        if row.get("id"):
+            tenant_store.soft_delete_document_by_id(auth.tenant_id, auth.user_id, row["id"], customer_id=cid)
+        else:
+            tenant_store.soft_delete_document(auth.tenant_id, auth.user_id, row["file_name"], customer_id=cid)
+        audit_id = tenant_store.record_delete_audit(
+            tenant_id=auth.tenant_id,
+            user_id=auth.user_id,
+            customer_id=cid or "",
+            document_id=row.get("id", "") or "",
+            file_name=row["file_name"],
+            result="success",
+            details_json=json.dumps(
+                {"storage_uri": path, "removed_empty_dirs": removed_dirs},
+                ensure_ascii=True,
+            ),
+        )
+        return {
+            "deleted": row["file_name"],
+            "doc_id": row.get("id", ""),
+            "audit_id": audit_id,
+            "storage_removed": True,
+            "removed_empty_dirs": removed_dirs,
+        }
     except OSError as e:
+        tenant_store.record_delete_audit(
+            tenant_id=auth.tenant_id,
+            user_id=auth.user_id,
+            customer_id=cid or "",
+            document_id=row.get("id", "") or "",
+            file_name=row["file_name"],
+            result="failed",
+            details_json=json.dumps({"error": str(e)}, ensure_ascii=True),
+        )
         raise HTTPException(500, str(e))
 
 
 @router.get("/api/documents/mistral-ocr-md")
-async def download_mistral_ocr_markdown(file: str = Query(...)):
+async def download_mistral_ocr_markdown(
+    file: str = Query(""),
+    doc_id: str = Query(""),
+    customer_id: str = Query(""),
+    auth=Depends(require_scopes("docs:read")),
+):
     """
     Run Mistral OCR on an uploaded PDF and return markdown as a download.
     User can re-upload the .md next to the .pdf (same basename) so indexing uses this text.
     """
-    if ".." in file or "/" in file or "\\" in file:
+    if file and (".." in file or "/" in file or "\\" in file):
         raise HTTPException(400, "Invalid filename")
+    cid = customer_id.strip() or None
+    row = _resolve_doc(auth, (file or None), (doc_id.strip() or None), cid)
+    file = row["file_name"]
     if not file.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are supported")
-    path = _find_file(file)
-    if not path:
-        raise HTTPException(404, f"File not found: {file}")
+    path = row.get("storage_uri") or _owned_path(auth, file, customer_id=cid)
     try:
         from document_loader import mistral_ocr_pdf_to_markdown
 
@@ -90,25 +185,29 @@ _LISTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", 
 
 
 @router.get("/api/documents")
-async def list_documents():
-    from backend.services.rag_service import rag
-    uploads = rag.uploads_folder
-    if not os.path.isdir(uploads):
-        return {"files": []}
+async def list_documents(
+    customer_id: str = Query(""),
+    auth=Depends(require_scopes("docs:read")),
+):
+    cid = customer_id.strip() or None
     files = []
-    for f in sorted(os.listdir(uploads)):
-        if f.startswith("."):
-            continue
-        path = os.path.join(uploads, f)
+    for row in tenant_store.list_documents_for_owner(auth.tenant_id, auth.user_id, customer_id=cid):
+        f = row["file_name"]
+        path = row["storage_uri"] or _find_file(f) or ""
         if not os.path.isfile(path):
             continue
         ext = os.path.splitext(f)[1].lower()
         if ext not in _LISTED_EXTENSIONS:
             continue
         files.append({
+            "doc_id": row.get("id", ""),
             "name": f,
             "size": os.path.getsize(path),
             "type": ext,
+            "customer_id": row.get("customer_id") or "default",
+            "index_status": row.get("index_status") or "pending",
+            "index_error": row.get("index_error") or "",
+            "indexed_at": row.get("indexed_at"),
         })
     return {"files": files}
 
@@ -121,13 +220,17 @@ async def document_info():
 
 @router.get("/api/documents/page")
 async def get_document_page(
-    file: str = Query(...),
+    file: str = Query(""),
+    doc_id: str = Query(""),
     page: int = Query(1),
+    customer_id: str = Query(""),
+    auth=Depends(require_scopes("docs:read")),
 ):
     """Render a PDF page as PNG and return base64."""
-    path = _find_file(file)
-    if not path:
-        raise HTTPException(404, f"File not found: {file}")
+    cid = customer_id.strip() or None
+    row = _resolve_doc(auth, (file or None), (doc_id.strip() or None), cid)
+    file = row["file_name"]
+    path = row.get("storage_uri") or _owned_path(auth, file, customer_id=cid)
 
     ext = os.path.splitext(file)[1].lower()
     if ext != ".pdf":
@@ -149,16 +252,20 @@ async def get_document_page(
 
 @router.get("/api/documents/text")
 async def get_document_text(
-    file: str = Query(...),
+    file: str = Query(""),
+    doc_id: str = Query(""),
     search: str = Query(""),
     page: int = Query(1),
+    customer_id: str = Query(""),
+    auth=Depends(require_scopes("docs:read")),
 ):
     """Return text/markdown file content with optional search highlight offset.
     For PDF: use page to pick match closest to cited location.
     For .md/.txt: page does NOT map to lines—use FIRST relevant match (avoids wrong scroll to end)."""
-    path = _find_file(file)
-    if not path:
-        raise HTTPException(404, f"File not found: {file}")
+    cid = customer_id.strip() or None
+    row = _resolve_doc(auth, (file or None), (doc_id.strip() or None), cid)
+    file = row["file_name"]
+    path = row.get("storage_uri") or _owned_path(auth, file, customer_id=cid)
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
@@ -232,11 +339,17 @@ async def get_document_text(
 
 
 @router.get("/api/documents/image")
-async def get_document_image(file: str = Query(...)):
+async def get_document_image(
+    file: str = Query(""),
+    doc_id: str = Query(""),
+    customer_id: str = Query(""),
+    auth=Depends(require_scopes("docs:read")),
+):
     """Serve an image file as binary response."""
-    path = _find_file(file)
-    if not path:
-        raise HTTPException(404, f"File not found: {file}")
+    cid = customer_id.strip() or None
+    row = _resolve_doc(auth, (file or None), (doc_id.strip() or None), cid)
+    file = row["file_name"]
+    path = row.get("storage_uri") or _owned_path(auth, file, customer_id=cid)
     ext = os.path.splitext(file)[1].lower()
     media_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                  ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp", ".tiff": "image/tiff", ".tif": "image/tiff"}

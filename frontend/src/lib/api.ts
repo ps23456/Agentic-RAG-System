@@ -149,7 +149,8 @@ export async function getDocumentPage(
   page: number
 ): Promise<DocumentPage> {
   const res = await fetch(
-    `${API}/api/documents/page?file=${encodeURIComponent(fileName)}&page=${page}`
+    `${API}/api/documents/page?file=${encodeURIComponent(fileName)}&page=${page}`,
+    { headers: withAuthHeaders() }
   );
   if (!res.ok) throw new Error(await res.text());
   return res.json();
@@ -163,7 +164,7 @@ export async function getDocumentText(
   let url = `${API}/api/documents/text?file=${encodeURIComponent(fileName)}`;
   if (search) url += `&search=${encodeURIComponent(search)}`;
   if (page && page > 0) url += `&page=${page}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: withAuthHeaders() });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -174,7 +175,8 @@ export async function getDocumentText(
  */
 export async function downloadMistralOcrMd(fileName: string): Promise<void> {
   const res = await fetch(
-    `${API}/api/documents/mistral-ocr-md?file=${encodeURIComponent(fileName)}`
+    `${API}/api/documents/mistral-ocr-md?file=${encodeURIComponent(fileName)}`,
+    { headers: withAuthHeaders() }
   );
   if (!res.ok) {
     const err = await res.text();
@@ -197,7 +199,7 @@ export async function downloadMistralOcrMd(fileName: string): Promise<void> {
 }
 
 export async function listDocuments(): Promise<{ files: UploadedFile[] }> {
-  const res = await fetch(`${API}/api/documents`);
+  const res = await fetch(`${API}/api/documents`, { headers: withAuthHeaders() });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -278,5 +280,11 @@ export async function extractFields(fileName: string): Promise<FieldsExtractResp
 }
 
 export async function getDocumentImage(fileName: string): Promise<string> {
-  return `${API}/api/documents/image?file=${encodeURIComponent(fileName)}`;
+  const res = await fetch(
+    `${API}/api/documents/image?file=${encodeURIComponent(fileName)}`,
+    { headers: withAuthHeaders() }
+  );
+  if (!res.ok) throw new Error(await res.text());
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
 }

@@ -992,6 +992,13 @@ def run_agentic_rag(
         prefer_user=PREFER_USER_METADATA_FILTER,
     ) or {}
 
+    # Scoped fast-path: when retrieval is already narrowed to a specific file
+    # or patient, reduce fan-out and candidate breadth to keep latency low.
+    has_file_scope = bool((metadata_filter or {}).get("file_name"))
+    has_patient_scope = bool((metadata_filter or {}).get("patient_name"))
+    if (has_file_scope or has_patient_scope) and len(search_queries) > 2:
+        search_queries = search_queries[:2]
+
     # Build understanding dict for UI display (agent understanding page)
     understanding = {
         "intent": intent,
@@ -1006,6 +1013,10 @@ def run_agentic_rag(
     }
 
     retrieve_k = METADATA_DIVERSITY_CANDIDATES if METADATA_DIVERSITY_ENABLED else MULTIMODAL_HYBRID_TOP_K
+    if has_file_scope:
+        retrieve_k = min(retrieve_k, 12)
+    elif has_patient_scope:
+        retrieve_k = min(retrieve_k, 20)
 
     # Active patient filter can be str or list (aliases); normalize once.
     patient_vals = (metadata_filter or {}).get("patient_name") or []

@@ -22,6 +22,7 @@ google-genai>=0.1.0
 google-generativeai>=0.8.0
 groq>=0.9.0
 python-dotenv>=1.0.0
+cryptography>=42.0.0
 # Docling: convert unstructured docs to structured (markdown). Needs numpy<2.
 # Docling (and its layout models) need opencv; pin to a version that works with numpy<2.
 # (opencv-python 4.13+ requires numpy>=2 and conflicts with torch/docling.)

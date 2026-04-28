@@ -13,18 +13,22 @@
 """
 import asyncio
 import json
+import logging
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from backend.security import require_api_key
+from backend.db.tenant_store import tenant_store
+from backend.security import require_scopes
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class ChatRequest(BaseModel):
     query: str
     conversation_id: str = ""
+    customer_id: str | None = None
     patient_filter: str | None = None
     web_search: bool = False
     file_filter: str | None = None
@@ -73,18 +77,38 @@ class EvaluateResponse(BaseModel):
 
 
 @router.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, _auth: None = Depends(require_api_key)):
+async def chat(req: ChatRequest, auth = Depends(require_scopes("chat:run"))):
     """Non-streaming chat. Kept for back-compat; prefer /api/chat/stream."""
     from backend.services.rag_service import rag
+    allowed_files = tenant_store.list_file_names_for_owner(
+        auth.tenant_id,
+        auth.user_id,
+        customer_id=(req.customer_id or None),
+    )
     result = await asyncio.to_thread(
         rag.chat,
         req.query,
         req.patient_filter,
         req.web_search,
         req.file_filter,
+        allowed_files,
+        auth.tenant_id,
     )
+    summary_text = result.get("summary", "")
+    try:
+        tenant_store.record_chat_turn(
+            tenant_id=auth.tenant_id,
+            user_id=auth.user_id,
+            query=req.query,
+            summary=summary_text,
+            session_title=req.conversation_id,
+            session_id=req.conversation_id or None,
+        )
+    except Exception:
+        # Stage 1 metadata persistence should never break chat serving.
+        logger.exception("chat_metadata_persist_failed")
     return ChatResponse(
-        summary=result.get("summary", ""),
+        summary=summary_text,
         sources=[Source(**s) for s in result.get("sources", [])],
         results=[ResultItem(**r) for r in result.get("results", [])],
         intent=result.get("intent", ""),
@@ -99,9 +123,14 @@ def _sse_event(kind: str, data) -> str:
 
 
 @router.post("/api/chat/stream")
-async def chat_stream(req: ChatRequest, _auth: None = Depends(require_api_key)):
+async def chat_stream(req: ChatRequest, auth = Depends(require_scopes("chat:run"))):
     """Streaming chat. Yields SSE events: meta, token..., done (or error)."""
     from backend.services.rag_service import rag
+    allowed_files = tenant_store.list_file_names_for_owner(
+        auth.tenant_id,
+        auth.user_id,
+        customer_id=(req.customer_id or None),
+    )
 
     async def iterator():
         queue: asyncio.Queue = asyncio.Queue()
@@ -114,6 +143,8 @@ async def chat_stream(req: ChatRequest, _auth: None = Depends(require_api_key)):
                     req.patient_filter,
                     req.web_search,
                     req.file_filter,
+                    allowed_files,
+                    auth.tenant_id,
                 ):
                     loop.call_soon_threadsafe(queue.put_nowait, (kind, data))
             except Exception as e:
@@ -141,7 +172,7 @@ async def chat_stream(req: ChatRequest, _auth: None = Depends(require_api_key)):
 
 
 @router.post("/api/chat/evaluate", response_model=EvaluateResponse)
-async def chat_evaluate(req: EvaluateRequest, _auth: None = Depends(require_api_key)):
+async def chat_evaluate(req: EvaluateRequest, _auth = Depends(require_scopes("chat:evaluate"))):
     """Run RAGAs faithfulness + answer relevancy on a completed turn.
 
     Called asynchronously by the UI AFTER the streamed answer is displayed,

@@ -31,9 +31,11 @@ import asyncio
 import json
 import time
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from backend.db.tenant_store import tenant_store
+from backend.security import require_scopes
 
 router = APIRouter(tags=["rag"])
 
@@ -44,6 +46,7 @@ MAX_QUESTION_CHARS = 2000
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=MAX_QUESTION_CHARS)
     patient: str | None = None
+    customer_id: str | None = None
     file: str | None = None
     web_search: bool = False
     stream: bool = False
@@ -82,13 +85,18 @@ def _sse_event(kind: str, data) -> str:
 
 
 @router.post("/query", response_model=QueryResponse)
-async def query_endpoint(req: QueryRequest):
+async def query_endpoint(req: QueryRequest, auth=Depends(require_scopes("query:run"))):
     """Blocking RAG query. Input: question. Output: answer + citations."""
     if req.stream:
-        return await _stream_query(req)
+        return await _stream_query(req, auth)
 
     from backend.services.rag_service import rag
 
+    allowed_files = tenant_store.list_file_names_for_owner(
+        auth.tenant_id,
+        auth.user_id,
+        customer_id=(req.customer_id or None),
+    )
     t0 = time.time()
     try:
         result = await asyncio.to_thread(
@@ -97,6 +105,8 @@ async def query_endpoint(req: QueryRequest):
             req.patient,
             req.web_search,
             req.file,
+            allowed_files,
+            auth.tenant_id,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"RAG query failed: {e}") from e
@@ -110,10 +120,15 @@ async def query_endpoint(req: QueryRequest):
     )
 
 
-async def _stream_query(req: QueryRequest) -> StreamingResponse:
+async def _stream_query(req: QueryRequest, auth) -> StreamingResponse:
     """Streaming variant — mirrors /api/chat/stream but uses `question` field."""
     from backend.services.rag_service import rag
 
+    allowed_files = tenant_store.list_file_names_for_owner(
+        auth.tenant_id,
+        auth.user_id,
+        customer_id=(req.customer_id or None),
+    )
     async def iterator():
         queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
@@ -125,6 +140,8 @@ async def _stream_query(req: QueryRequest) -> StreamingResponse:
                     req.patient,
                     req.web_search,
                     req.file,
+                    allowed_files,
+                    auth.tenant_id,
                 ):
                     loop.call_soon_threadsafe(queue.put_nowait, (kind, data))
             except Exception as e:

@@ -52,6 +52,24 @@ class RAGService:
             return k, "openai"
         return "", "openai"
 
+    def _tenant_llm_config(self, tenant_id: str | None) -> tuple[str, str]:
+        """Resolve tenant BYOK config, fallback to environment defaults."""
+        if tenant_id:
+            try:
+                from backend.db.tenant_store import tenant_store
+
+                s = tenant_store.get_tenant_settings(tenant_id)
+                mode = (s.get("llm_mode") or "platform_default").strip().lower()
+                if mode != "tenant_byok":
+                    return self._llm_key_and_provider()
+                key = (s.get("llm_api_key") or "").strip()
+                provider = (s.get("llm_provider") or "").strip().lower()
+                if key and provider in {"groq", "openai", "gemini"}:
+                    return key, provider
+            except Exception as e:
+                logger.debug("tenant_llm_config_fallback: %s", e)
+        return self._llm_key_and_provider()
+
     def initialize(self):
         try:
             from document_loader import set_mistral_ocr_key
@@ -313,6 +331,8 @@ class RAGService:
         patient_filter: str | None,
         web_search: bool,
         file_filter: str | None,
+        allowed_files: set[str] | None = None,
+        tenant_id: str | None = None,
     ) -> dict | None:
         """Run the retrieval pipeline. Returns all data needed for summary generation.
 
@@ -335,6 +355,12 @@ class RAGService:
 
         effective_patient_filter = patient_filter
         effective_file_filter = file_filter
+        if allowed_files is not None and effective_file_filter and effective_file_filter not in allowed_files:
+            # Caller asked for a file outside tenant scope.
+            effective_file_filter = None
+        if allowed_files and not effective_file_filter and len(allowed_files) == 1:
+            # Strongest scoped mode: single-file allowed set from tenant/customer/doc filters.
+            effective_file_filter = next(iter(allowed_files))
         if (not effective_patient_filter or effective_patient_filter == "All") or not effective_file_filter:
             inferred_patient, inferred_file = self._infer_scope_from_query(query, catalog)
             if (not effective_patient_filter or effective_patient_filter == "All") and inferred_patient:
@@ -354,8 +380,13 @@ class RAGService:
             user_meta["patient_name"] = aliases.get(effective_patient_filter, [effective_patient_filter])
         if effective_file_filter:
             user_meta["file_name"] = effective_file_filter
+        elif allowed_files and len(allowed_files) <= 8:
+            # Push tenant/customer scope down into retrieval to avoid corpus-wide candidate generation.
+            user_meta["file_name"] = sorted(allowed_files)
 
-        llm_key, provider = self._llm_key_and_provider()
+        llm_key, provider = self._tenant_llm_config(tenant_id)
+        scoped_fast_mode = bool(effective_file_filter) or bool(allowed_files and len(allowed_files) <= 8)
+        use_llm_for_retrieval = bool(llm_key) and not scoped_fast_mode
 
         t0 = time.time()
         understanding, fused, direct_answer = run_agentic_rag(
@@ -365,7 +396,7 @@ class RAGService:
             image_retriever,
             catalog=catalog,
             user_metadata_filter=user_meta or None,
-            use_llm=bool(llm_key),
+            use_llm=use_llm_for_retrieval,
             llm_api_key=llm_key,
             llm_provider=provider,
             page_trees=self.page_trees if self.page_trees else None,
@@ -379,6 +410,11 @@ class RAGService:
                 c = r.get("content")
                 fn = getattr(c, "file_name", "") if hasattr(c, "file_name") else (c or {}).get("file_name", "")
                 if fn != effective_file_filter:
+                    continue
+            if allowed_files is not None:
+                c = r.get("content")
+                fn = getattr(c, "file_name", "") if hasattr(c, "file_name") else (c or {}).get("file_name", "")
+                if fn and fn not in allowed_files:
                     continue
             content = r["content"]
             if r["type"] == "text":
@@ -406,6 +442,8 @@ class RAGService:
         if self.page_trees:
             t0 = time.time()
             results = self._merge_tree_and_rag(query, results, file_filter=effective_file_filter)
+            if allowed_files is not None:
+                results = [r for r in results if (r.get("file_name") or "") in allowed_files]
             logger.info("[chat-timing] merge_tree_and_rag: %.2fs", time.time() - t0)
 
         q_lower = (query or "").strip().lower()
@@ -506,7 +544,15 @@ class RAGService:
             ),
         }
 
-    def chat(self, query: str, patient_filter: str | None = None, web_search: bool = False, file_filter: str | None = None) -> dict:
+    def chat(
+        self,
+        query: str,
+        patient_filter: str | None = None,
+        web_search: bool = False,
+        file_filter: str | None = None,
+        allowed_files: set[str] | None = None,
+        tenant_id: str | None = None,
+    ) -> dict:
         """Run the full search pipeline and return structured results (non-streaming).
 
         Kept for back-compat with `POST /api/chat`. New clients should use
@@ -514,7 +560,14 @@ class RAGService:
         """
         from indexing.page_tree import generate_summary_from_results
 
-        ctx = self._build_chat_context(query, patient_filter, web_search, file_filter)
+        ctx = self._build_chat_context(
+            query,
+            patient_filter,
+            web_search,
+            file_filter,
+            allowed_files=allowed_files,
+            tenant_id=tenant_id,
+        )
         if ctx is None:
             return {"summary": "No documents indexed yet. Please upload files and reindex.", "sources": [], "results": []}
 
@@ -568,6 +621,8 @@ class RAGService:
         patient_filter: str | None = None,
         web_search: bool = False,
         file_filter: str | None = None,
+        allowed_files: set[str] | None = None,
+        tenant_id: str | None = None,
     ):
         """Generator yielding SSE-friendly events for streaming chat.
 
@@ -589,7 +644,14 @@ class RAGService:
         # retrieval finishes, which can look like the backend is hung.
         yield ("status", {"stage": "retrieving"})
 
-        ctx = self._build_chat_context(query, patient_filter, web_search, file_filter)
+        ctx = self._build_chat_context(
+            query,
+            patient_filter,
+            web_search,
+            file_filter,
+            allowed_files=allowed_files,
+            tenant_id=tenant_id,
+        )
         if ctx is None:
             msg = "No documents indexed yet. Please upload files and reindex."
             yield ("meta", {"intent": "", "reasoning": "", "results": [], "sources": []})

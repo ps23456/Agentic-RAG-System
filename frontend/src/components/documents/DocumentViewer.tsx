@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { ChevronLeft, ChevronRight, X, FileText, ZoomIn, ZoomOut, Search } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import type { ViewerState } from "../../lib/types";
-import { getDocumentPage, getDocumentText } from "../../lib/api";
+import { getDocumentImage, getDocumentPage, getDocumentText } from "../../lib/api";
 
 interface Props {
   viewers: ViewerState[];
@@ -24,10 +24,15 @@ export function DocumentViewer({
   const [zoom, setZoom] = useState(100);
   const contentRef = useRef<HTMLDivElement>(null);
   const highlightRef = useRef<HTMLSpanElement>(null);
+  const imageObjectUrlRef = useRef<string | null>(null);
 
   const v = viewers[activeIdx];
 
   useEffect(() => {
+    if (imageObjectUrlRef.current) {
+      URL.revokeObjectURL(imageObjectUrlRef.current);
+      imageObjectUrlRef.current = null;
+    }
     if (!v) {
       setPageImage(null);
       setTextContent(null);
@@ -56,9 +61,22 @@ export function DocumentViewer({
         .catch(() => setTextContent(null))
         .finally(() => setLoading(false));
     } else if (["jpg", "jpeg", "png", "gif", "webp", "bmp"].includes(ext)) {
+      setLoading(true);
       setTextContent(null);
-      setPageImage(`/api/documents/image?file=${encodeURIComponent(v.fileName)}`);
+      getDocumentImage(v.fileName)
+        .then((url) => {
+          imageObjectUrlRef.current = url;
+          setPageImage(url);
+        })
+        .catch(() => setPageImage(null))
+        .finally(() => setLoading(false));
     }
+    return () => {
+      if (imageObjectUrlRef.current) {
+        URL.revokeObjectURL(imageObjectUrlRef.current);
+        imageObjectUrlRef.current = null;
+      }
+    };
   }, [v?.fileName, v?.page, v?.searchContext]);
 
   useEffect(() => {

@@ -10,7 +10,7 @@ from threading import Lock
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 class JsonFormatter(logging.Formatter):
     """Simple JSON formatter for production-friendly logs."""
@@ -68,8 +68,19 @@ set_mistral_ocr_key(os.environ.get("MISTRAL_OCR_API_KEY", "").strip())
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from backend.db.tenant_store import tenant_store
     from backend.services.rag_service import rag
+    tenant_store.initialize_schema()
+    tenant_store.ensure_default_bootstrap(os.environ.get("BACKEND_API_KEY", "").strip())
     rag.initialize()
+    try:
+        tenant_store.sync_local_uploads_for_owner(
+            tenant_id="tenant_default",
+            user_id="user_default_admin",
+            uploads_dir=rag.uploads_folder,
+        )
+    except Exception as e:
+        logger.warning("legacy_upload_sync_failed: %s", e)
     yield
 
 
@@ -150,6 +161,15 @@ app.add_middleware(
 async def request_metrics_middleware(request: Request, call_next):
     t0 = time.perf_counter()
     status_code = 500
+    tenant_ctx = None
+    try:
+        from backend.db.tenant_store import tenant_store
+
+        api_key = (request.headers.get("X-API-Key", "") or "").strip()
+        if api_key:
+            tenant_ctx = tenant_store.resolve_api_key(api_key)
+    except Exception:
+        tenant_ctx = None
     try:
         response = await call_next(request)
         status_code = response.status_code
@@ -163,6 +183,19 @@ async def request_metrics_middleware(request: Request, call_next):
     finally:
         latency_ms = (time.perf_counter() - t0) * 1000.0
         metrics.observe(request.url.path, latency_ms, status_code)
+        if tenant_ctx is not None:
+            try:
+                from backend.db.tenant_store import tenant_store
+
+                tenant_store.record_request_usage(
+                    tenant_id=tenant_ctx.tenant_id,
+                    user_id=tenant_ctx.user_id,
+                    route=request.url.path,
+                    status_code=status_code,
+                    latency_ms=latency_ms,
+                )
+            except Exception:
+                logger.exception("tenant_usage_record_failed")
         logger.info(
             "request_complete",
             extra={
@@ -180,7 +213,8 @@ from backend.routes.index import router as index_router
 from backend.routes.medical import router as medical_router
 from backend.routes.fields import router as fields_router
 from backend.routes.query import router as query_router
-from backend.security import require_api_key
+from backend.routes.tenant_settings import router as tenant_settings_router
+from backend.security import get_auth_context, require_api_key, require_scopes
 app.include_router(chat_router)
 app.include_router(documents_router)
 app.include_router(upload_router)
@@ -188,6 +222,7 @@ app.include_router(index_router)
 app.include_router(medical_router)
 app.include_router(fields_router)
 app.include_router(query_router)
+app.include_router(tenant_settings_router)
 
 
 @app.get("/api/health")
@@ -196,6 +231,66 @@ async def health():
 
 
 @app.get("/api/metrics")
-async def metrics_summary(_auth: None = Depends(require_api_key)):
+async def metrics_summary(_auth = Depends(require_scopes("admin:read"))):
     """Minimal runtime metrics for production diagnostics."""
     return JSONResponse(metrics.snapshot())
+
+
+@app.get("/api/metrics/tenant")
+async def tenant_metrics(days: int = 7, ctx=Depends(require_scopes("admin:read"))):
+    """Tenant-scoped usage summary for monitoring and billing readiness."""
+    from backend.db.tenant_store import tenant_store
+
+    summary = tenant_store.get_tenant_usage_summary(ctx.tenant_id, days=days)
+    grouped = tenant_store.get_tenant_usage_grouped(ctx.tenant_id, days=days)
+    return {"tenant_id": ctx.tenant_id, **summary, "by_group": grouped}
+
+
+@app.get("/api/metrics/tenant/export")
+async def tenant_metrics_export(
+    days: int = 7,
+    format: str = "json",
+    ctx=Depends(require_scopes("admin:read")),
+):
+    """Export tenant usage rows for billing/reporting (json or csv)."""
+    from backend.db.tenant_store import tenant_store
+
+    rows = tenant_store.export_tenant_usage_rows(ctx.tenant_id, days=days)
+    grouped = tenant_store.get_tenant_usage_grouped(ctx.tenant_id, days=days)
+    if (format or "").strip().lower() == "csv":
+        csv_data = tenant_store.usage_rows_to_csv(rows)
+        return Response(
+            content=csv_data,
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="tenant_usage_{ctx.tenant_id}_{days}d.csv"'
+            },
+        )
+    return {
+        "tenant_id": ctx.tenant_id,
+        "days": max(1, min(int(days), 90)),
+        "rows": rows,
+        "by_group": grouped,
+    }
+
+
+@app.get("/api/auth/context")
+async def auth_context(ctx=Depends(require_scopes("auth:read"))):
+    """Debug endpoint: returns resolved tenant/user context for current key."""
+    return {
+        "tenant_id": ctx.tenant_id,
+        "tenant_slug": ctx.tenant_slug,
+        "user_id": ctx.user_id,
+        "user_email": ctx.user_email,
+        "key_id": ctx.key_id,
+        "key_label": ctx.key_label,
+        "source": ctx.source,
+    }
+
+
+@app.get("/api/auth/registry-stats")
+async def auth_registry_stats(_ctx=Depends(require_scopes("admin:read"))):
+    """Debug endpoint: shows tenant registry table counts used by this process."""
+    from backend.db.tenant_store import tenant_store
+
+    return tenant_store.debug_stats()
