@@ -37,5 +37,5 @@ fastapi>=0.104.0
 uvicorn>=0.24.0
 python-multipart>=0.0.6
 # RAG evaluation (optional): scripts/run_ragas_eval.py — Python 3.10+
-ragas>=0.1.21
-datasets>=2.14.0
+# ragas>=0.1.21
+# datasets>=2.14.0
