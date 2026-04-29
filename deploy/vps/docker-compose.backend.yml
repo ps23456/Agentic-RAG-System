@@ -1,0 +1,14 @@
+services:
+  backend:
+    build:
+      context: ../..
+      dockerfile: deploy/vps/Dockerfile.backend
+    container_name: agentic-rag-backend
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    ports:
+      - "127.0.0.1:7000:7000"
+    volumes:
+      - ../../data:/app/data
+      - ../../storage:/app/storage
