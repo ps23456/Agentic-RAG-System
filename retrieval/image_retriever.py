@@ -108,6 +108,13 @@ def _encode_query(model, processor, query: str) -> List[List[float]]:
             input_ids=inputs["input_ids"],
             attention_mask=inputs.get("attention_mask"),
         )
+        if not hasattr(out, "norm"):
+            if hasattr(out, "pooler_output") and out.pooler_output is not None:
+                out = out.pooler_output
+            elif hasattr(out, "last_hidden_state"):
+                out = out.last_hidden_state[:, 0, :]
+            else:
+                raise TypeError(f"Unsupported query feature output type: {type(out)}")
         out = out / out.norm(dim=-1, keepdim=True)
     return out.cpu().numpy().tolist()
 

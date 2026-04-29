@@ -130,6 +130,13 @@ def _encode_images(model, processor, images: List[Any]) -> List[List[float]]:
     inputs = processor(images=images, return_tensors="pt", padding=True)
     with torch.no_grad():
         outputs = model.get_image_features(pixel_values=inputs["pixel_values"])
+        if not hasattr(outputs, "norm"):
+            if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                outputs = outputs.pooler_output
+            elif hasattr(outputs, "last_hidden_state"):
+                outputs = outputs.last_hidden_state[:, 0, :]
+            else:
+                raise TypeError(f"Unsupported image feature output type: {type(outputs)}")
         # L2 normalize for cosine similarity in Chroma
         outputs = outputs / outputs.norm(dim=-1, keepdim=True)
     return outputs.cpu().numpy().tolist()
@@ -144,6 +151,13 @@ def _encode_texts(model, processor, texts: List[str]) -> List[List[float]]:
             input_ids=inputs["input_ids"],
             attention_mask=inputs.get("attention_mask"),
         )
+        if not hasattr(outputs, "norm"):
+            if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+                outputs = outputs.pooler_output
+            elif hasattr(outputs, "last_hidden_state"):
+                outputs = outputs.last_hidden_state[:, 0, :]
+            else:
+                raise TypeError(f"Unsupported text feature output type: {type(outputs)}")
         outputs = outputs / outputs.norm(dim=-1, keepdim=True)
     return outputs.cpu().numpy().tolist()
 
