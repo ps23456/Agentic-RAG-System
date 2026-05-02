@@ -314,6 +314,25 @@ chmod 600 /opt/agentic-rag/.env
 
 ## 16) Quick troubleshooting
 
+### `404 {"detail":"Not Found"}` on index/status when using `$BASE_URL`
+
+If `BASE_URL` already ends with `/api` (example: `export BASE_URL=https://isr.aventhic.com/api`), the path must be **without** an extra `/api`:
+
+- Wrong: `$BASE_URL/api/index/images` → hits `/api/api/index/images`
+- Correct: `$BASE_URL/index/images` → hits `/api/index/images`
+
+Same for status: `$BASE_URL/index/status` (not `$BASE_URL/api/index/status`). Upload stays `$BASE_URL/upload`.
+
+### `413 Request Entity Too Large` on upload
+
+Nginx rejects the body before it reaches FastAPI. In your site `server { ... }` add (or bump) `client_max_body_size`:
+
+```nginx
+client_max_body_size 100m;
+```
+
+Then `nginx -t && systemctl reload nginx`. If Certbot added a separate `server { }` block for `:443`, add the same line there too.
+
 ### Nginx config error
 
 ```bash
