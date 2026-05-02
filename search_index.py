@@ -266,12 +266,24 @@ class SearchIndex:
             for k, v in metadata_filter.items():
                 if v is None or (isinstance(v, (list, str)) and not v):
                     continue
-                if k in ("patient_name", "doctor_name"):
-                    # v can be str or list (OCR variants: ["Rita Pepper", "Rika Popper", "Rita Peyer"])
-                    if isinstance(v, list):
+                if isinstance(v, (list, tuple)):
+                    # Chroma rejects {"$eq": <list>}; use membership (same pattern as image_retriever).
+                    if not v:
+                        continue
+                    if k in ("patient_name", "doctor_name"):
                         variants = list(dict.fromkeys(str(x).strip() for x in v if x))
+                        if not variants:
+                            continue
+                        if len(variants) == 1:
+                            clauses.append({k: {"$eq": variants[0]}})
+                        else:
+                            clauses.append({"$or": [{k: {"$eq": var}} for var in variants]})
                     else:
-                        variants = list({v, str(v).upper(), str(v).title(), " ".join(w.capitalize() for w in str(v).split())})
+                        clauses.append({k: {"$in": list(v)}})
+                elif k in ("patient_name", "doctor_name"):
+                    variants = list(
+                        {v, str(v).upper(), str(v).title(), " ".join(w.capitalize() for w in str(v).split())}
+                    )
                     if not variants:
                         continue
                     if len(variants) == 1:
@@ -378,8 +390,11 @@ class SearchIndex:
             if v is None or (isinstance(v, (list, str)) and not v):
                 continue
             chunk_val = getattr(chunk, k, "") or ""
-            if k in ("patient_name", "doctor_name") and isinstance(v, list):
-                if chunk_val not in v:
+            if isinstance(v, (list, tuple)):
+                if k in ("patient_name", "doctor_name"):
+                    if chunk_val not in v:
+                        return False
+                elif chunk_val not in v:
                     return False
             elif chunk_val != v:
                 return False
