@@ -1119,10 +1119,17 @@ def run_agentic_rag(
             # Compute the allowed-file set BEFORE scanning so unrelated trees
             # are never opened. For a query like "Alyson Jude's activity
             # restrictions" this means only her files are scanned.
-            target_file = (metadata_filter or {}).get("file_name")
+            # file_name may be a str (single file) or list/tuple (tenant scope ≤8 files — see rag_service).
+            target_file_raw = (metadata_filter or {}).get("file_name")
             allowed_files: set[str] | None = None
-            if target_file:
-                allowed_files = {target_file}
+            if target_file_raw:
+                if isinstance(target_file_raw, (list, tuple)):
+                    allowed_files = {str(f).strip() for f in target_file_raw if f}
+                    if not allowed_files:
+                        allowed_files = None
+                else:
+                    tf = str(target_file_raw).strip()
+                    allowed_files = {tf} if tf else None
             elif active_patients and index and getattr(index, "chunks", None):
                 allowed_files = {
                     getattr(c, "file_name", "")
