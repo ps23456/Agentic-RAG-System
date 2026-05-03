@@ -20,9 +20,15 @@ from document_loader import extract_chunk_metadata
 _PATIENT_NAME_SIMILARITY_THRESHOLD = 0.82
 
 # Detect filenames in queries so we can filter retrieval to that file (Chroma metadata file_name).
-# Supports uploads like "TEE_TBrown (1).pdf" — older pattern only matched [\w-]+ before the dot.
+# Supports uploads like "TEE_TBrown (1).pdf" — single-token stem + optional "(n)" suffix.
 _FILENAME_PATTERN = re.compile(
     r"\b([A-Za-z0-9_\-]+(?:\s*\(\d+\))?\.(?:png|jpg|jpeg|gif|bmp|tiff|tif|pdf|webp|md|txt|json))\b",
+    re.IGNORECASE,
+)
+# Separate pattern: spaced basenames ("Safety test.pdf"). Two words; first word >=3 chars avoids
+# matching "at APS_TBrown.pdf" over the real single-token filename when both match.
+_FILENAME_SPACE_PATTERN = re.compile(
+    r"\b([\w\-]{3,}\s+[\w\-]{2,}\.(?:png|jpg|jpeg|gif|bmp|tiff|tif|pdf|webp|md|txt|json))\b",
     re.IGNORECASE,
 )
 
@@ -49,6 +55,9 @@ def _extract_query_filename(query: str) -> Optional[str]:
     cands: list[str] = []
 
     for m in _FILENAME_PATTERN.finditer(query):
+        cands.append(m.group(1).strip())
+
+    for m in _FILENAME_SPACE_PATTERN.finditer(query):
         cands.append(m.group(1).strip())
 
     for m in _PATH_AFTER_SLASH.finditer(query):
