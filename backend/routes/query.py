@@ -85,6 +85,7 @@ def _sse_event(kind: str, data) -> str:
 
 
 @router.post("/query", response_model=QueryResponse)
+@router.post("/api/query", response_model=QueryResponse)
 async def query_endpoint(req: QueryRequest, auth=Depends(require_scopes("query:run"))):
     """Blocking RAG query. Input: question. Output: answer + citations."""
     if req.stream:
