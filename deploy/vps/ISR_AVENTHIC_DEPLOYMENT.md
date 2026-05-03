@@ -314,6 +314,17 @@ chmod 600 /opt/agentic-rag/.env
 
 ## 16) Quick troubleshooting
 
+### Homepage `500` and error log shows `redirect while internally redirecting to "/index.html"`
+
+Usually **`index index.html`** in the **same `server { }`** as **`try_files … /index.html`** causes an **internal redirect loop**. Fix:
+
+- Remove **`index index.html;`** from that server block (SPA uses `try_files` for `/index.html`).
+- Use **`try_files $uri /index.html;`** (avoid **`$uri/`** if cycles persist).
+
+Mirror the change in Certbot’s **HTTPS** `:443` block if it duplicates the directives.
+
+Then `nginx -t && systemctl reload nginx`.
+
 ### `404 {"detail":"Not Found"}` on index/status when using `$BASE_URL`
 
 If `BASE_URL` already ends with `/api` (example: `export BASE_URL=https://isr.aventhic.com/api`), the path must be **without** an extra `/api`:
