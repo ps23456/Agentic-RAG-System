@@ -145,11 +145,21 @@ class RAGService:
         except Exception:
             return []
 
-    def _infer_scope_from_query(self, query: str, catalog: dict) -> tuple[str | None, str | None]:
+    def _infer_scope_from_query(
+        self,
+        query: str,
+        catalog: dict,
+        allowed_files: set[str] | None = None,
+    ) -> tuple[str | None, str | None]:
         """Infer patient/file scope from natural-language query.
 
         This keeps quality intact (same retrieval/reranking) while reducing
         latency by avoiding unrelated files when user intent is clearly scoped.
+
+        `allowed_files`, when provided, is the tenant/customer-scoped document
+        list. We use it to resolve messy real filenames (e.g. "Screenshot
+        2026-04-28 at 1.13.12 PM.png") and short stems (e.g. "instahelp")
+        that the regex-based extractor cannot reliably parse.
         """
         q = (query or "").strip()
         if not q:
@@ -158,8 +168,13 @@ class RAGService:
 
         inferred_file: str | None = None
         try:
-            from retrieval.agentic_rag import _extract_query_filename
-            inferred_file = _extract_query_filename(q)
+            from retrieval.agentic_rag import (
+                _resolve_query_filename,
+                _extract_query_filename,
+            )
+            inferred_file = _resolve_query_filename(q, allowed_files=allowed_files)
+            if not inferred_file:
+                inferred_file = _extract_query_filename(q)
         except Exception:
             inferred_file = None
 
@@ -362,7 +377,9 @@ class RAGService:
             # Strongest scoped mode: single-file allowed set from tenant/customer/doc filters.
             effective_file_filter = next(iter(allowed_files))
         if (not effective_patient_filter or effective_patient_filter == "All") or not effective_file_filter:
-            inferred_patient, inferred_file = self._infer_scope_from_query(query, catalog)
+            inferred_patient, inferred_file = self._infer_scope_from_query(
+                query, catalog, allowed_files=allowed_files
+            )
             if (not effective_patient_filter or effective_patient_filter == "All") and inferred_patient:
                 effective_patient_filter = inferred_patient
             if not effective_file_filter and inferred_file:
@@ -428,15 +445,17 @@ class RAGService:
                     "section_title": getattr(content, "_section_title", "") or "",
                 })
             else:
+                snippet_src = content.get("ocr_text", "") or content.get("auto_caption", "") or ""
                 results.append({
                     "type": "image",
                     "file_name": content.get("file_name", ""),
                     "page": content.get("page"),
                     "score": r.get("final_score", 0),
-                    "snippet": (content.get("ocr_text", "") or "")[:500],
+                    "snippet": snippet_src[:500],
                     "patient_name": content.get("patient_name", "") or "",
                     "is_pdf_page": content.get("is_pdf_page", False),
                     "path": content.get("path", ""),
+                    "auto_caption": content.get("auto_caption", "") or "",
                 })
 
         if self.page_trees:

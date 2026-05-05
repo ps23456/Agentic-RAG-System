@@ -1045,6 +1045,7 @@ def build_summary_prompt_and_sources(
             fname = content.get("file_name", "")
             pg = content.get("page", "?")
             ocr = content.get("ocr_text", "") or ""
+            caption = content.get("auto_caption", "") or ""
             page_text = ""
             if fname and str(pg).isdigit() and fname.lower().endswith(".pdf"):
                 img_path = content.get("path", "")
@@ -1057,7 +1058,12 @@ def build_summary_prompt_and_sources(
                 if os.path.isfile(pdf_path):
                     nearby = _read_pdf_page_range(pdf_path, int(pg), int(pg))
                     page_text = nearby[0][1][:2500] if nearby else ""
-            txt = page_text or ocr[:3000] or f"[Image from {fname} page {pg}]"
+            # Combine page text / OCR with the short auto-caption when available so
+            # the LLM has a concise visual description in addition to extracted text.
+            primary = page_text or ocr[:3000]
+            if caption:
+                primary = (primary + "\n\n[Auto caption: " + caption + "]") if primary else f"[Auto caption: {caption}]"
+            txt = primary or f"[Image from {fname} page {pg}]"
             txt = _normalize_for_summary(txt)
             src_key = (fname, str(pg))
             if src_key not in seen_sources:

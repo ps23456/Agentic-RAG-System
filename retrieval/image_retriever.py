@@ -171,6 +171,7 @@ class ImageRetriever:
                     for i, uid in enumerate(ids_list):
                         meta = metas_list[i] if i < len(metas_list) else {}
                         ocr_text = meta.get("ocr_text", "") or ""
+                        auto_caption = meta.get("auto_caption", "") or ""
                         item = {
                             "id": uid,
                             "file_name": meta.get("file_name", ""),
@@ -183,6 +184,7 @@ class ImageRetriever:
                             "report_type": meta.get("report_type", "") or "",
                             "claim_number": meta.get("claim_number", "") or "",
                             "ocr_text": ocr_text,
+                            "auto_caption": auto_caption,
                         }
                         filename_hits.append((item, 1.0))
                     break
@@ -235,10 +237,16 @@ class ImageRetriever:
             dist = float(distances[i]) if i < len(distances) and distances[i] is not None else 0
             clip_score = max(0.0, 1.0 - dist)
             ocr_text = meta.get("ocr_text", "") or ""
-            ocr_rel = _ocr_text_relevance(query, ocr_text)
+            auto_caption = meta.get("auto_caption", "") or ""
+            # Combine OCR + auto_caption for relevance scoring so image-only files
+            # with weak OCR but a meaningful caption can still surface in broad mode.
+            scoring_text = ocr_text if not auto_caption else (
+                ocr_text + "\n\n" + auto_caption if ocr_text else auto_caption
+            )
+            ocr_rel = _ocr_text_relevance(query, scoring_text)
             # Blend CLIP with OCR: higher OCR weight when boost_ocr (text-heavy queries) so images with exact words rank first
             ocr_weight = 0.65 if boost_ocr else 0.4
-            score = clip_score + ocr_weight * ocr_rel if ocr_text else clip_score
+            score = clip_score + ocr_weight * ocr_rel if scoring_text else clip_score
             item = {
                 "id": uid,
                 "file_name": meta.get("file_name", ""),
@@ -251,6 +259,7 @@ class ImageRetriever:
                 "report_type": meta.get("report_type", "") or "",
                 "claim_number": meta.get("claim_number", "") or "",
                 "ocr_text": ocr_text,
+                "auto_caption": auto_caption,
             }
             key = (item.get("file_name", ""), item.get("page", ""))
             if key not in {(x[0].get("file_name"), x[0].get("page")) for x in out}:

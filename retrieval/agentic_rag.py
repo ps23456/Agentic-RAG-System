@@ -46,9 +46,14 @@ _AT_PATH_FILE = re.compile(
 
 def _extract_query_filename(query: str) -> Optional[str]:
     """
-    Infer which uploaded file (Chroma file_name) the user refers to.
+    Infer which uploaded file (Chroma file_name) the user refers to via regex.
     Collects all plausible filenames, normalizes to basename, picks the most specific
     (longest basename wins — avoids first-match bugs like report.md vs TEE_TBrown (1).md).
+
+    Limitation: regex cannot reliably parse messy basenames like
+    "Screenshot 2026-04-28 at 1.13.12 PM.png". For those cases callers should use
+    `_resolve_query_filename(query, allowed_files=...)` which does substring
+    matching against the real document list and falls back to this regex.
     """
     if not (query and query.strip()):
         return None
@@ -85,6 +90,78 @@ def _extract_query_filename(query: str) -> Optional[str]:
         return (len(name), pos)
 
     return max(uniq, key=score)
+
+
+# Minimum stem length to accept as a substring match. Avoids matching tiny
+# common tokens like "a", "to", "of" that could appear in any sentence and
+# point to an unrelated file.
+_RESOLVER_MIN_STEM_LEN = 4
+
+
+def _resolve_query_filename(
+    query: str,
+    allowed_files: Optional[set[str]] = None,
+) -> Optional[str]:
+    """Find which uploaded file a natural-language query refers to.
+
+    Strategy (in order, longest match wins):
+      1. Exact basename substring match against `allowed_files` (case-insensitive).
+         Handles messy real names like "Screenshot 2026-04-28 at 1.13.12 PM.png".
+      2. Stem-only substring match (basename without extension), so questions like
+         "license info from instahelp" resolve to "instahelp.png".
+      3. Fallback to regex-based `_extract_query_filename` for "@path/file.ext"
+         shortcuts and well-formed names not yet in `allowed_files`.
+
+    Returns the canonical filename as stored (preserves original casing/spaces).
+    Disabled when env var RESOLVER_ENABLED is set to "false" (safe rollback).
+    """
+    if os.environ.get("RESOLVER_ENABLED", "true").strip().lower() == "false":
+        return _extract_query_filename(query)
+
+    if not (query and query.strip()):
+        return None
+
+    q_lower = query.lower()
+
+    if allowed_files:
+        # 1) Full-basename substring match.
+        full_hits: list[tuple[int, int, str]] = []
+        for fname in allowed_files:
+            if not fname:
+                continue
+            base = fname.lower()
+            if len(base) < _RESOLVER_MIN_STEM_LEN:
+                continue
+            pos = q_lower.find(base)
+            if pos >= 0:
+                full_hits.append((len(base), pos, fname))
+        if full_hits:
+            full_hits.sort(key=lambda t: (-t[0], t[1]))
+            return full_hits[0][2]
+
+        # 2) Stem-only substring match (no extension), to catch "instahelp"
+        #    when the stored file is "instahelp.png". Word-boundary aware to
+        #    avoid matching "test" inside "Safety test" prose etc.
+        stem_hits: list[tuple[int, int, str]] = []
+        for fname in allowed_files:
+            if not fname:
+                continue
+            stem = os.path.splitext(fname)[0].strip()
+            if len(stem) < _RESOLVER_MIN_STEM_LEN:
+                continue
+            stem_low = stem.lower()
+            try:
+                pat = re.compile(r"\b" + re.escape(stem_low) + r"\b")
+            except re.error:
+                continue
+            m = pat.search(q_lower)
+            if m:
+                stem_hits.append((len(stem_low), m.start(), fname))
+        if stem_hits:
+            stem_hits.sort(key=lambda t: (-t[0], t[1]))
+            return stem_hits[0][2]
+
+    return _extract_query_filename(query)
 
 
 # ──────────────────────────────────────────────────────────────

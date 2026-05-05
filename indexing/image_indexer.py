@@ -31,6 +31,56 @@ _VLM_DESCRIPTION_MIN_OCR_LEN = 150
 _FORM_LIKE_KEYWORDS = ("patient", "diagnosis", "claim", "physician", "disability", "restriction", "primary", "secondary")
 
 
+def _auto_caption_enabled() -> bool:
+    """When IMAGE_AUTO_CAPTION=true, always generate a short caption for image
+    files (not just when OCR is short). Caption stored as separate `auto_caption`
+    metadata so it can be scored independently of OCR text in retrieval.
+    Default false for safe rollout — same behavior as before until enabled.
+    """
+    return os.environ.get("IMAGE_AUTO_CAPTION", "false").strip().lower() == "true"
+
+
+def _vlm_caption_short(pil_image) -> str:
+    """Short 2-sentence caption used when IMAGE_AUTO_CAPTION is on.
+
+    Stored separately as `auto_caption`. Long, detailed `_vlm_describe_image`
+    is reserved for OCR-poor images (existing behavior). Both can coexist.
+    """
+    import base64, io
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        return ""
+    try:
+        buf = io.BytesIO()
+        pil_image.save(buf, format="JPEG", quality=80)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        import requests
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": (
+                        "Caption this image in 2 short sentences. "
+                        "Include the main subject, scene, and any clearly visible text verbatim. "
+                        "Do not invent details. No markdown."
+                    )},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ]}],
+                "max_tokens": 120,
+            },
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            cap = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+            logger.info("Auto-caption generated (%d chars)", len(cap))
+            return cap[:600]
+    except Exception as e:
+        logger.warning("Auto-caption failed: %s", e)
+    return ""
+
+
 def _vlm_describe_image(pil_image) -> str:
     """Use Groq VLM to generate a text description of an image when OCR text is too short."""
     import base64, io, os
@@ -222,6 +272,9 @@ def _collect_image_items(
                             form_desc = _vlm_describe_form_sections(img)
                             if form_desc:
                                 ocr_text = ocr_text + "\n\n[Section headers: " + form_desc + "]"
+                        # Always-on short caption when IMAGE_AUTO_CAPTION=true. Stored separately
+                        # so retrieval can score it without diluting OCR-only behavior when off.
+                        auto_caption = _vlm_caption_short(img) if _auto_caption_enabled() else ""
                         patient_from_path, report_type = _extract_medical_report_metadata(path, data_folder)
                         patient_name = patient_from_path or (doc_meta.get("patient_name", "") or "")
                         items.append({
@@ -233,6 +286,7 @@ def _collect_image_items(
                             "file_type": "image",
                             "is_pdf_page": False,
                             "ocr_text": ocr_text[:2000],
+                            "auto_caption": auto_caption,
                             "patient_name": patient_name,
                             "report_type": report_type,
                             "claim_number": doc_meta.get("claim_number", "") or "",
@@ -284,6 +338,10 @@ def _collect_image_items(
                             form_desc = _vlm_describe_form_sections(pil_img)
                             if form_desc:
                                 page_ocr = page_ocr + "\n\n[Section headers: " + form_desc + "]"
+                        # PDF pages typically have rich OCR; skip the always-on caption to save
+                        # cost. Caption stays useful for image-only files. Toggle by removing
+                        # the env-flag check here if you want PDF-page captions too.
+                        auto_caption = ""
                         patient_from_path, report_type = _extract_medical_report_metadata(path, data_folder)
                         patient_name = patient_from_path or (doc_meta.get("patient_name", "") or "")
                         items.append({
@@ -295,6 +353,7 @@ def _collect_image_items(
                             "file_type": "pdf_page",
                             "is_pdf_page": True,
                             "ocr_text": page_ocr[:2000],
+                            "auto_caption": auto_caption,
                             "patient_name": patient_name,
                             "report_type": report_type,
                             "claim_number": doc_meta.get("claim_number", "") or "",
@@ -422,6 +481,7 @@ def build_image_index(
             "file_type": x["file_type"],
             "is_pdf_page": str(x.get("is_pdf_page", False)),
             "ocr_text": x.get("ocr_text", "") or "",
+            "auto_caption": x.get("auto_caption", "") or "",
             "patient_name": _normalize_name(x.get("patient_name", "") or ""),
             "report_type": x.get("report_type", "") or "",
             "claim_number": x.get("claim_number", "") or "",
