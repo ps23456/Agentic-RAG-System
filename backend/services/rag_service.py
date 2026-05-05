@@ -739,6 +739,47 @@ class RAGService:
         self._index_progress = min(100, max(0, percent))
         self._index_stage = stage
 
+    def _active_file_basenames(self) -> set[str]:
+        """Files currently on disk under data_folder.
+
+        Used as the source of truth for "active" vector rows during reindex
+        prune. We use disk presence (not the documents table) because the
+        text/image indexers themselves walk the disk, and we want our
+        prune to mirror exactly what the indexer would treat as live.
+        """
+        active: set[str] = set()
+        try:
+            for root, _dirs, files in os.walk(self.data_folder):
+                for f in files:
+                    if not f or f.startswith("."):
+                        continue
+                    active.add(f)
+        except Exception as e:
+            logger.warning("_active_file_basenames walk failed: %s", e)
+        return active
+
+    def _prune_stale_vectors(self) -> None:
+        """Drop Chroma rows whose file_name is no longer on disk.
+
+        Safety net for any file that was deleted before delete-time purge
+        was wired up, or removed out-of-band. Never raises.
+        """
+        try:
+            from indexing.vector_cleanup import prune_vectors_to_active_set
+            active = self._active_file_basenames()
+            if not active:
+                # Defensive — vector_cleanup also guards this case.
+                return
+            result = prune_vectors_to_active_set(active)
+            if result.get("text_removed") or result.get("image_removed"):
+                logger.info(
+                    "Reindex prune dropped stale vectors: text=%d image=%d",
+                    result.get("text_removed", 0),
+                    result.get("image_removed", 0),
+                )
+        except Exception as e:
+            logger.warning("Reindex prune skipped: %s", e)
+
     def reindex_docs(self, file_filter: set[str] | None = None):
         """Re-index documents: text chunks + tree indexes.
 
@@ -778,6 +819,13 @@ class RAGService:
             )
             self.page_trees = trees
 
+            # Full reindex: drop any vector rows for files that no longer
+            # exist on disk. Skipped for targeted reindexes (file_filter set)
+            # so we don't accidentally remove other tenants' data.
+            if not file_filter:
+                self._set_progress(95, "Pruning stale vectors...")
+                self._prune_stale_vectors()
+
             self._set_progress(100, "Done")
             self._index_status = "done"
         except Exception as e:
@@ -810,6 +858,12 @@ class RAGService:
                 progress_callback=on_progress,
                 file_filter=file_filter,
             )
+
+            # Full image reindex: prune stale rows for images no longer on disk.
+            if not file_filter:
+                self._set_progress(95, "Pruning stale vectors...")
+                self._prune_stale_vectors()
+
             self.image_count = get_image_index_count()
 
             self._set_progress(100, "Done")
@@ -847,6 +901,12 @@ class RAGService:
             trees, _n = build_trees_for_folder(self.data_folder, "both", llm_key, provider)
             self.page_trees = trees
 
+            # Full reindex (everything): drop stale rows for files removed
+            # from disk. Refresh image_count once more so the post-prune
+            # number is reported.
+            self._prune_stale_vectors()
+            self.image_count = get_image_index_count()
+
             self._index_status = "done"
         except Exception as e:
             logger.error("Reindex failed: %s", e)
@@ -866,6 +926,46 @@ class RAGService:
             "progress": self._index_progress,
             "stage": self._index_stage,
         }
+
+    def drop_text_chunks_for_file(self, file_name: str) -> int:
+        """Remove in-memory chunks whose file_name matches.
+
+        Called after a delete so get_index_info() reflects the new chunk
+        count immediately. Also rebuilds BM25 if it was already built so
+        the parallel corpus stays consistent. Image count is refreshed
+        from Chroma here too.
+        """
+        removed = 0
+        try:
+            si = self.search_index
+            if si and getattr(si, "chunks", None):
+                before = len(si.chunks)
+                si.chunks = [c for c in si.chunks if getattr(c, "file_name", "") != file_name]
+                removed = before - len(si.chunks)
+                if removed and hasattr(si, "chunk_by_id"):
+                    si.chunk_by_id = {c.chunk_id: c for c in si.chunks}
+                if removed and getattr(si, "_bm25", None) is not None:
+                    try:
+                        si.build_bm25()
+                    except Exception:
+                        si._bm25 = None
+                        si._bm25_corpus = []
+            # Drop the corresponding page tree, if any.
+            if file_name in self.page_trees:
+                try:
+                    del self.page_trees[file_name]
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("drop_text_chunks_for_file failed: %s", e)
+
+        # Refresh cached image_count from Chroma (cheap call).
+        try:
+            from indexing.image_indexer import get_image_index_count
+            self.image_count = get_image_index_count()
+        except Exception:
+            pass
+        return removed
 
 
 rag = RAGService()

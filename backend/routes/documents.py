@@ -112,6 +112,24 @@ async def delete_document(
             tenant_store.soft_delete_document_by_id(auth.tenant_id, auth.user_id, row["id"], customer_id=cid)
         else:
             tenant_store.soft_delete_document(auth.tenant_id, auth.user_id, row["file_name"], customer_id=cid)
+
+        # Purge vectors so retrieval no longer surfaces this file.
+        # Best-effort: failures are logged inside the helper but never raised.
+        try:
+            from indexing.vector_cleanup import purge_file_from_vectors
+            purge_result = purge_file_from_vectors(row["file_name"], doc_id=row.get("id"))
+        except Exception:
+            purge_result = {"text_removed": 0, "image_removed": 0, "errors": ["purge_helper_unavailable"]}
+
+        # Refresh in-memory text-index chunks so get_index_info() reports the
+        # post-delete chunk count immediately. Image count is read from Chroma
+        # on demand by rag_service.get_index_info, so it self-heals.
+        try:
+            from backend.services.rag_service import rag
+            rag.drop_text_chunks_for_file(row["file_name"])
+        except Exception:
+            pass
+
         audit_id = tenant_store.record_delete_audit(
             tenant_id=auth.tenant_id,
             user_id=auth.user_id,
@@ -120,7 +138,12 @@ async def delete_document(
             file_name=row["file_name"],
             result="success",
             details_json=json.dumps(
-                {"storage_uri": path, "removed_empty_dirs": removed_dirs},
+                {
+                    "storage_uri": path,
+                    "removed_empty_dirs": removed_dirs,
+                    "vectors_text_removed": purge_result.get("text_removed", 0),
+                    "vectors_image_removed": purge_result.get("image_removed", 0),
+                },
                 ensure_ascii=True,
             ),
         )
@@ -130,6 +153,10 @@ async def delete_document(
             "audit_id": audit_id,
             "storage_removed": True,
             "removed_empty_dirs": removed_dirs,
+            "vectors_removed": {
+                "text": purge_result.get("text_removed", 0),
+                "image": purge_result.get("image_removed", 0),
+            },
         }
     except OSError as e:
         tenant_store.record_delete_audit(
