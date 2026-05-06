@@ -519,3 +519,183 @@ def get_image_index_count() -> int:
         return coll.count()
     except Exception:
         return 0
+
+
+def _load_pil_for_row(meta: dict):
+    """Reconstruct a PIL image for an existing image_collection row.
+
+    For standalone image files: open from `path`.
+    For PDF pages: render the page from `path` at page index = `page` (1-indexed).
+    Returns None if reconstruction is not possible (file missing, etc).
+    """
+    from PIL import Image
+
+    path = (meta or {}).get("path") or ""
+    if not path or not os.path.isfile(path):
+        return None
+
+    is_pdf_page = str((meta or {}).get("is_pdf_page", "")).lower() == "true"
+    page_num = int((meta or {}).get("page", 1) or 1)
+
+    try:
+        if is_pdf_page:
+            import fitz
+            doc = fitz.open(path)
+            try:
+                idx = max(0, min(page_num - 1, len(doc) - 1))
+                pix = doc.load_page(idx).get_pixmap(dpi=150, alpha=False)
+                buf = pix.tobytes("png")
+            finally:
+                doc.close()
+            img = Image.open(io.BytesIO(buf)).convert("RGB")
+        else:
+            img = Image.open(path)
+            img.load()
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+
+        w, h = img.size
+        if max(w, h) > 1024:
+            img = img.resize(
+                (min(1024, w), min(1024, h)),
+                Image.Resampling.LANCZOS,
+            )
+        return img
+    except Exception as e:
+        logger.warning("Could not reconstruct PIL for %s: %s", path, e)
+        return None
+
+
+def backfill_auto_captions(
+    file_names: set[str] | None = None,
+    allowed_path_prefix: str | None = None,
+    include_pdf_pages: bool = False,
+    force: bool = False,
+    limit: int | None = None,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+) -> dict:
+    """Re-run auto-caption on already-indexed images and patch the
+    `auto_caption` metadata in image_collection in place.
+
+    Does NOT re-encode CLIP embeddings — that's the whole point: it's a
+    cheap metadata-only update for images that were indexed before
+    IMAGE_AUTO_CAPTION was turned on, or before that feature shipped.
+
+    Args:
+      file_names: when provided, only rows whose `file_name` is in this
+        set are considered.
+      allowed_path_prefix: when provided, restricts to rows whose `path`
+        startswith this prefix. Used by the API route to scope to one
+        tenant/customer storage directory.
+      include_pdf_pages: when False (default), skip rows where
+        `is_pdf_page=true`. PDF pages typically have rich OCR; captioning
+        them is expensive and offers little gain.
+      force: when False (default), only update rows whose existing
+        `auto_caption` is empty. When True, regenerate even if a caption
+        already exists.
+      limit: optional cap on number of rows to update in this call.
+
+    Returns dict: {updated, skipped, errors, total_candidates}.
+    """
+    out = {"updated": 0, "skipped": 0, "errors": [], "total_candidates": 0}
+    try:
+        import chromadb
+        from chromadb.config import Settings
+    except ImportError:
+        out["errors"].append("chromadb not installed")
+        return out
+
+    if not os.path.isdir(CHROMA_PERSIST_DIR):
+        out["errors"].append("chroma persist dir missing")
+        return out
+
+    try:
+        client = chromadb.PersistentClient(
+            path=CHROMA_PERSIST_DIR,
+            settings=Settings(anonymized_telemetry=False),
+        )
+        coll = client.get_collection(name=CHROMA_IMAGE_COLLECTION_NAME)
+    except Exception as e:
+        out["errors"].append(f"open_collection_failed: {e}")
+        return out
+
+    try:
+        existing = coll.get(include=["metadatas"])
+    except Exception as e:
+        out["errors"].append(f"chroma_get_failed: {e}")
+        return out
+
+    ids = list(existing.get("ids") or [])
+    metas = list(existing.get("metadatas") or [])
+
+    # Build the candidate list first so we can report total_candidates.
+    candidates: list[tuple[str, dict]] = []
+    for i, uid in enumerate(ids):
+        meta = metas[i] if i < len(metas) else {}
+        meta = meta or {}
+        fname = (meta.get("file_name") or "").strip()
+        path = (meta.get("path") or "").strip()
+        is_pdf_page = str(meta.get("is_pdf_page", "")).lower() == "true"
+        existing_caption = (meta.get("auto_caption") or "").strip()
+
+        if file_names is not None and fname not in file_names:
+            continue
+        if allowed_path_prefix and not path.startswith(allowed_path_prefix):
+            continue
+        if is_pdf_page and not include_pdf_pages:
+            continue
+        if existing_caption and not force:
+            continue
+        candidates.append((uid, meta))
+
+    out["total_candidates"] = len(candidates)
+    if not candidates:
+        return out
+
+    if limit is not None and limit > 0:
+        candidates = candidates[:limit]
+
+    # Process one-by-one; small batch upsert at the end.
+    updated_ids: list[str] = []
+    updated_metas: list[dict] = []
+    for n, (uid, meta) in enumerate(candidates, start=1):
+        if progress_callback:
+            try:
+                pct = min(95, int(n / max(1, len(candidates)) * 95))
+                progress_callback(pct, f"Captioning {meta.get('file_name','')}")
+            except Exception:
+                pass
+
+        pil = _load_pil_for_row(meta)
+        if pil is None:
+            out["skipped"] += 1
+            continue
+        try:
+            cap = _vlm_caption_short(pil)
+        except Exception as e:
+            out["errors"].append(f"{meta.get('file_name','')}: {e}")
+            cap = ""
+        if not cap:
+            out["skipped"] += 1
+            continue
+
+        # Replace-style update; copy old meta then patch the caption field.
+        new_meta = dict(meta)
+        new_meta["auto_caption"] = cap
+        updated_ids.append(uid)
+        updated_metas.append(new_meta)
+
+    if updated_ids:
+        try:
+            # Patch metadata only; embeddings stay as-is.
+            coll.update(ids=updated_ids, metadatas=updated_metas)
+            out["updated"] = len(updated_ids)
+        except Exception as e:
+            out["errors"].append(f"chroma_update_failed: {e}")
+
+    if progress_callback:
+        try:
+            progress_callback(100, "Done")
+        except Exception:
+            pass
+    return out
