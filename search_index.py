@@ -181,6 +181,11 @@ class SearchIndex:
                 "doc_quality": getattr(c, "doc_quality", "") or "",
                 "embedding_text": getattr(c, "embedding_text", "") or "",
                 "last_modified": float(getattr(c, "last_modified", 0.0)),
+                # Tenant ownership — used for multi-tenant where-clause
+                # filtering during retrieval and for tenant-scoped purge.
+                "tenant_id": getattr(c, "tenant_id", "") or "",
+                "user_id": getattr(c, "user_id", "") or "",
+                "customer_id": getattr(c, "customer_id", "") or "",
             }
             for c in chunks_to_encode
         ]

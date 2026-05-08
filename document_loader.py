@@ -429,6 +429,13 @@ class Chunk:
     doc_quality: str = ""          # "structured" for auto-detected clean PDFs, "" for standard
     embedding_text: str = ""       # summary text for vector embedding (used instead of full text for large chunks)
     last_modified: float = 0.0     # file mtime for incremental indexing
+    # Multi-tenant ownership — populated from documents table at index time
+    # so retrieval/purge/prune can hard-filter by owner. Empty strings are
+    # only expected on legacy rows indexed before this field was added; the
+    # backfill admin route patches those.
+    tenant_id: str = ""
+    user_id: str = ""
+    customer_id: str = ""
 
 
 def _extract_text_pdfplumber(path: str) -> List[tuple[int, str]]:
@@ -1098,6 +1105,15 @@ def load_and_chunk_folder(
         logger.warning("Data folder does not exist: %s", folder)
         return []
 
+    # Refresh ownership snapshot at the start of every run so newly
+    # uploaded documents pick up tenant metadata on first index.
+    try:
+        from indexing.tenant_resolver import get_resolver
+        owner_resolver = get_resolver(refresh=True)
+    except Exception as _e:  # pragma: no cover — never fail indexing here
+        logger.warning("Tenant resolver unavailable in load_and_chunk_folder: %s", _e)
+        owner_resolver = None
+
     all_chunks: List[Chunk] = []
     seen_bases: dict[str, int] = {}
     processed_count = 0
@@ -1169,15 +1185,31 @@ def load_and_chunk_folder(
             document_metadata = extract_chunk_metadata(full_text)
 
             # Route structured PDFs through section-based chunking (fast path)
+            new_chunks_for_file: list[Chunk] = []
             if ext in PDF_EXTENSIONS and _classify_document(pages) == "structured":
                 logger.info("Structured PDF detected: %s (%d pages) → section-based chunking", base, len(pages))
                 for c in chunk_structured_document(pages, base, doc_type, base_id, document_metadata):
-                    all_chunks.append(c)
+                    new_chunks_for_file.append(c)
             else:
                 current_quality = "structured" if ext in MARKDOWN_EXTENSIONS else ""
                 for page_num, text in pages:
                     for c in chunk_text(page_num, text, base, doc_type, base_id, document_metadata, doc_quality=current_quality):
-                        all_chunks.append(c)
+                        new_chunks_for_file.append(c)
+
+            # Stamp tenant ownership on the just-built chunks. Without this
+            # multi-tenant retrieval can't filter by owner — same basename
+            # across tenants would otherwise be indistinguishable.
+            owner = (
+                owner_resolver.lookup(path=path, basename=base)
+                if owner_resolver is not None
+                else {"tenant_id": "", "user_id": "", "customer_id": ""}
+            )
+            for c in new_chunks_for_file:
+                c.tenant_id = owner.get("tenant_id", "") or ""
+                c.user_id = owner.get("user_id", "") or ""
+                c.customer_id = owner.get("customer_id", "") or ""
+
+            all_chunks.extend(new_chunks_for_file)
 
             # Assign mtime to all new chunks for this file
             for c in all_chunks:

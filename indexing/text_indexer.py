@@ -64,6 +64,9 @@ def load_existing_index() -> Optional[SearchIndex]:
             embedding_text=meta.get("embedding_text", ""),
             # Required for incremental chunking: must match document_loader.load_and_chunk_folder
             last_modified=float(meta.get("last_modified", 0.0) or 0.0),
+            tenant_id=meta.get("tenant_id", "") or "",
+            user_id=meta.get("user_id", "") or "",
+            customer_id=meta.get("customer_id", "") or "",
         )
         chunks.append(c)
 

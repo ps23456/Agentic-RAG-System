@@ -400,6 +400,12 @@ class RAGService:
         elif allowed_files and len(allowed_files) <= 8:
             # Push tenant/customer scope down into retrieval to avoid corpus-wide candidate generation.
             user_meta["file_name"] = sorted(allowed_files)
+        # Hard multi-tenant guard: when we know the caller's tenant, force
+        # Chroma to only return rows stamped with that tenant_id. This is
+        # the strongest available defense against cross-tenant leakage when
+        # two tenants happen to upload files with the same basename.
+        if tenant_id:
+            user_meta["tenant_id"] = tenant_id
 
         llm_key, provider = self._tenant_llm_config(tenant_id)
         scoped_fast_mode = bool(effective_file_filter) or bool(allowed_files and len(allowed_files) <= 8)
@@ -423,14 +429,23 @@ class RAGService:
 
         results: list[dict] = []
         for r in (fused or [])[:25]:
+            c = r.get("content")
+            fn = getattr(c, "file_name", "") if hasattr(c, "file_name") else (c or {}).get("file_name", "")
+            # Tenant guard for in-memory (BM25/verbatim) hits — Chroma's
+            # where-clause already filters vector hits, but BM25 reads from
+            # `self.chunks` which is a global cache. Drop anything not owned
+            # by the caller. Empty tenant_id on a chunk is treated as legacy
+            # data; once the backfill admin route runs, those vanish.
+            if tenant_id:
+                row_tenant = (
+                    getattr(c, "tenant_id", "") if hasattr(c, "tenant_id") else (c or {}).get("tenant_id", "")
+                )
+                if row_tenant and row_tenant != tenant_id:
+                    continue
             if effective_file_filter:
-                c = r.get("content")
-                fn = getattr(c, "file_name", "") if hasattr(c, "file_name") else (c or {}).get("file_name", "")
                 if fn != effective_file_filter:
                     continue
             if allowed_files is not None:
-                c = r.get("content")
-                fn = getattr(c, "file_name", "") if hasattr(c, "file_name") else (c or {}).get("file_name", "")
                 if fn and fn not in allowed_files:
                     continue
             content = r["content"]
@@ -759,18 +774,41 @@ class RAGService:
         return active
 
     def _prune_stale_vectors(self) -> None:
-        """Drop Chroma rows whose file_name is no longer on disk.
+        """Drop Chroma rows that no longer correspond to an active document.
 
-        Safety net for any file that was deleted before delete-time purge
-        was wired up, or removed out-of-band. Never raises.
+        Tenant-aware: builds {tenant_id: {file_name}} from the documents
+        table and asks vector_cleanup to compare each row against the right
+        tenant's active set. Falls back to disk-scanned file_names for any
+        legacy row whose `tenant_id` metadata is empty (e.g. indexed before
+        the multi-tenant wiring shipped — the backfill admin route fixes
+        those once it's run).
+
+        Best-effort: never raises into the indexing path.
         """
         try:
             from indexing.vector_cleanup import prune_vectors_to_active_set
-            active = self._active_file_basenames()
-            if not active:
-                # Defensive — vector_cleanup also guards this case.
+            from backend.db.tenant_store import tenant_store
+
+            active_disk = self._active_file_basenames()
+
+            tenant_active: dict[str, set[str]] = {}
+            try:
+                for r in tenant_store.list_active_documents_for_indexing():
+                    tid = (r.get("tenant_id") or "").strip()
+                    fname = (r.get("file_name") or "").strip()
+                    if not tid or not fname:
+                        continue
+                    tenant_active.setdefault(tid, set()).add(fname)
+            except Exception as e:
+                logger.warning("_prune_stale_vectors: tenant snapshot failed (%s)", e)
+
+            if not active_disk and not tenant_active:
                 return
-            result = prune_vectors_to_active_set(active)
+
+            result = prune_vectors_to_active_set(
+                active_disk,
+                active_tenant_files=tenant_active or None,
+            )
             if result.get("text_removed") or result.get("image_removed"):
                 logger.info(
                     "Reindex prune dropped stale vectors: text=%d image=%d",

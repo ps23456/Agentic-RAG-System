@@ -113,11 +113,18 @@ async def delete_document(
         else:
             tenant_store.soft_delete_document(auth.tenant_id, auth.user_id, row["file_name"], customer_id=cid)
 
-        # Purge vectors so retrieval no longer surfaces this file.
-        # Best-effort: failures are logged inside the helper but never raised.
+        # Purge vectors so retrieval no longer surfaces this file. Pass
+        # tenant_id (and customer_id when known) so a delete in tenant A
+        # cannot ever remove rows owned by tenant B that share the same
+        # basename. Best-effort: failures logged inside the helper.
         try:
             from indexing.vector_cleanup import purge_file_from_vectors
-            purge_result = purge_file_from_vectors(row["file_name"], doc_id=row.get("id"))
+            purge_result = purge_file_from_vectors(
+                row["file_name"],
+                doc_id=row.get("id"),
+                tenant_id=auth.tenant_id,
+                customer_id=cid,
+            )
         except Exception:
             purge_result = {"text_removed": 0, "image_removed": 0, "errors": ["purge_helper_unavailable"]}
 

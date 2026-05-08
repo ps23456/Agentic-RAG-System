@@ -229,6 +229,15 @@ def _collect_image_items(
     if not os.path.isdir(data_folder):
         return items
 
+    # Refresh ownership snapshot per index run so newly uploaded files
+    # acquire tenant metadata on first pass.
+    try:
+        from indexing.tenant_resolver import get_resolver
+        owner_resolver = get_resolver(refresh=True)
+    except Exception as _e:  # pragma: no cover
+        logger.warning("Tenant resolver unavailable in image indexer: %s", _e)
+        owner_resolver = None
+
     for root, _dirs, files in os.walk(data_folder):
         for name in sorted(files):
             path = os.path.join(root, name)
@@ -277,6 +286,11 @@ def _collect_image_items(
                         auto_caption = _vlm_caption_short(img) if _auto_caption_enabled() else ""
                         patient_from_path, report_type = _extract_medical_report_metadata(path, data_folder)
                         patient_name = patient_from_path or (doc_meta.get("patient_name", "") or "")
+                        owner = (
+                            owner_resolver.lookup(path=path, basename=base)
+                            if owner_resolver is not None
+                            else {"tenant_id": "", "user_id": "", "customer_id": ""}
+                        )
                         items.append({
                             "id": uid,
                             "file_name": base,
@@ -294,6 +308,9 @@ def _collect_image_items(
                             "group_number": doc_meta.get("group_number", "") or "",
                             "doctor_name": doc_meta.get("doctor_name", "") or "",
                             "last_modified": mtime,
+                            "tenant_id": owner.get("tenant_id", "") or "",
+                            "user_id": owner.get("user_id", "") or "",
+                            "customer_id": owner.get("customer_id", "") or "",
                         })
                         processed += 1
                         if progress_callback:
@@ -344,6 +361,11 @@ def _collect_image_items(
                         auto_caption = ""
                         patient_from_path, report_type = _extract_medical_report_metadata(path, data_folder)
                         patient_name = patient_from_path or (doc_meta.get("patient_name", "") or "")
+                        owner = (
+                            owner_resolver.lookup(path=path, basename=base)
+                            if owner_resolver is not None
+                            else {"tenant_id": "", "user_id": "", "customer_id": ""}
+                        )
                         items.append({
                             "id": uid,
                             "file_name": base,
@@ -360,6 +382,9 @@ def _collect_image_items(
                             "policy_number": doc_meta.get("policy_number", "") or "",
                             "doctor_name": doc_meta.get("doctor_name", "") or "",
                             "last_modified": mtime,
+                            "tenant_id": owner.get("tenant_id", "") or "",
+                            "user_id": owner.get("user_id", "") or "",
+                            "customer_id": owner.get("customer_id", "") or "",
                         })
                         processed += 1
                         if progress_callback and processed % 3 == 0:
@@ -489,6 +514,11 @@ def build_image_index(
             "group_number": x.get("group_number", "") or "",
             "doctor_name": _normalize_name(x.get("doctor_name", "") or ""),
             "last_modified": float(x.get("last_modified", 0.0)),
+            # Tenant ownership for hard multi-tenant isolation in retrieval
+            # and tenant-scoped purge/prune.
+            "tenant_id": x.get("tenant_id", "") or "",
+            "user_id": x.get("user_id", "") or "",
+            "customer_id": x.get("customer_id", "") or "",
         }
         for x in image_items
     ]

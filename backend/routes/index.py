@@ -168,6 +168,38 @@ async def index_status():
     return rag.get_index_info()
 
 
+class BackfillTenantMetadataRequest(BaseModel):
+    """Body for POST /api/index/backfill_tenant_metadata.
+
+    `force`: when True, also rewrites tenant_id on rows that already have one.
+        Default False — only patches rows missing tenant_id.
+    `limit`: max rows updated per collection in this call. Useful to keep
+        the request bounded for very large collections; call again to
+        drain remaining unmatched rows.
+    """
+    force: Optional[bool] = False
+    limit: Optional[int] = None
+
+
+@router.post("/api/index/backfill_tenant_metadata")
+async def trigger_backfill_tenant_metadata(
+    body: Optional[BackfillTenantMetadataRequest] = None,
+    _auth=Depends(require_scopes("admin:write")),
+):
+    """One-time / on-demand: stamp tenant_id, user_id, customer_id onto
+    existing Chroma rows by looking each one up in the documents table.
+
+    Use this once after deploying multi-tenant metadata to retrofit
+    legacy vectors so they participate in tenant-scoped retrieval and
+    purge. Safe to call repeatedly — idempotent unless `force=True`.
+    """
+    force = bool(body.force) if body else False
+    limit = body.limit if body else None
+    from indexing.vector_cleanup import backfill_tenant_metadata
+    result = backfill_tenant_metadata(force=force, limit=limit)
+    return {"status": "ok", **result}
+
+
 class BackfillCaptionsRequest(BaseModel):
     """Body for POST /api/index/backfill_captions.
 

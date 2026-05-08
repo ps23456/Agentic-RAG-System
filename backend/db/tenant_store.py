@@ -567,6 +567,35 @@ class TenantStore:
         rows = self.list_documents_for_owner(tenant_id, user_id, customer_id=customer_id)
         return {r["file_name"] for r in rows if r.get("file_name")}
 
+    def list_active_documents_for_indexing(self) -> list[dict]:
+        """All active rows across all tenants/users.
+
+        Returned dicts contain (tenant_id, user_id, customer_id, file_name,
+        storage_uri). Used by the indexer to stamp tenant metadata onto
+        every Chroma row at upsert time, and by purge/prune callers that
+        need to know which tenant a file on disk actually belongs to.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT tenant_id, user_id, customer_id, file_name, storage_uri
+                FROM documents
+                WHERE status = 'active'
+                """,
+            ).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            out.append(
+                {
+                    "tenant_id": r["tenant_id"] or "",
+                    "user_id": r["user_id"] or "",
+                    "customer_id": r["customer_id"] or "",
+                    "file_name": r["file_name"] or "",
+                    "storage_uri": r["storage_uri"] or "",
+                }
+            )
+        return out
+
     def get_document_for_owner(
         self,
         tenant_id: str,
