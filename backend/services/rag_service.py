@@ -450,16 +450,21 @@ class RAGService:
             if not r:
                 continue
             c = r.get("content")
-            fn = getattr(c, "file_name", "") if hasattr(c, "file_name") else (c or {}).get("file_name", "")
+            # `c` may be a TreeChunk/Chunk dataclass OR an image dict OR None.
+            # `hasattr(TreeChunk, "tenant_id")` returns False even though
+            # TreeChunk is truthy, which previously fell into `(c or {}).get(...)`
+            # and crashed because TreeChunk has no `.get` method. Always read
+            # attributes via getattr (returns default for missing attrs) and
+            # only use `.get()` when `c` is actually a dict.
+            c_dict = c if isinstance(c, dict) else {}
+            fn = getattr(c, "file_name", "") or c_dict.get("file_name", "")
             # Tenant guard for in-memory (BM25/verbatim) hits — Chroma's
             # where-clause already filters vector hits, but BM25 reads from
             # `self.chunks` which is a global cache. Drop anything not owned
             # by the caller. Empty tenant_id on a chunk is treated as legacy
             # data; once the backfill admin route runs, those vanish.
             if tenant_id:
-                row_tenant = (
-                    getattr(c, "tenant_id", "") if hasattr(c, "tenant_id") else (c or {}).get("tenant_id", "")
-                )
+                row_tenant = getattr(c, "tenant_id", "") or c_dict.get("tenant_id", "")
                 if row_tenant and row_tenant != tenant_id:
                     continue
             if effective_file_filter:
