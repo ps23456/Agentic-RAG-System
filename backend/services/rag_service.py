@@ -445,6 +445,9 @@ class RAGService:
             return None
 
         results: list[dict] = []
+        dropped_tenant: list[str] = []
+        dropped_file_filter: list[str] = []
+        dropped_allowed: list[str] = []
         for raw in (fused or [])[:25]:
             r = _normalize_fused_item(raw)
             if not r:
@@ -466,12 +469,15 @@ class RAGService:
             if tenant_id:
                 row_tenant = getattr(c, "tenant_id", "") or c_dict.get("tenant_id", "")
                 if row_tenant and row_tenant != tenant_id:
+                    dropped_tenant.append(f"{fn}@{row_tenant}")
                     continue
             if effective_file_filter:
                 if fn != effective_file_filter:
+                    dropped_file_filter.append(fn or "<empty>")
                     continue
             if allowed_files is not None:
                 if fn and fn not in allowed_files:
+                    dropped_allowed.append(fn)
                     continue
             content = r["content"]
             if r["type"] == "text":
@@ -499,6 +505,28 @@ class RAGService:
                     "path": content.get("path", ""),
                     "auto_caption": content.get("auto_caption", "") or "",
                 })
+
+        # Diagnostic: when retrieval returned candidates but every one was
+        # filtered out, log which guard fired and a sample of dropped names.
+        # This is the only practical way to debug "frontend empty answer while
+        # /api/chat curl works" — typically an allowed_files / customer_id /
+        # tenant mismatch between the two auth contexts.
+        if (fused or []) and not results:
+            logger.warning(
+                "[chat-filter] dropped all %d fused items | tenant=%s "
+                "file_filter=%r allowed_files=%d dropped_tenant=%d "
+                "dropped_file_filter=%d dropped_allowed=%d "
+                "sample_allowed=%s sample_dropped_allowed=%s",
+                len(fused or []),
+                tenant_id or "-",
+                effective_file_filter or "-",
+                len(allowed_files) if allowed_files is not None else -1,
+                len(dropped_tenant),
+                len(dropped_file_filter),
+                len(dropped_allowed),
+                sorted(list(allowed_files))[:5] if allowed_files else [],
+                dropped_allowed[:5],
+            )
 
         if self.page_trees:
             t0 = time.time()
