@@ -1285,8 +1285,14 @@ def run_agentic_rag(
         query_type = classify_query(query)  # Ensure set for fallback (list_entities path may not set it)
         existing_ids = set()
         for r in fused:
-            c = r["content"]
-            existing_ids.add(c.chunk_id if r["type"] == "text" else (c.get("file_name", ""), c.get("page", "")))
+            if not isinstance(r, dict):
+                continue
+            c = r.get("content")
+            r_type = r.get("type")
+            if r_type == "text" and hasattr(c, "chunk_id"):
+                existing_ids.add(c.chunk_id)
+            elif r_type == "image" and isinstance(c, dict):
+                existing_ids.add((c.get("file_name", ""), c.get("page", "")))
 
         fallback_text, fallback_image = _multi_query_retrieve(
             [query] + search_queries[:1], text_retriever, image_retriever, index,
@@ -1313,18 +1319,28 @@ def run_agentic_rag(
         active_patients = {p.lower() for p in (pn_val if isinstance(pn_val, (list, tuple)) else [pn_val]) if p}
 
         for r in fallback_fused:
-            c = r["content"]
-            key = c.chunk_id if r["type"] == "text" else (c.get("file_name", ""), c.get("page", ""))
+            if not isinstance(r, dict):
+                continue
+            c = r.get("content")
+            r_type = r.get("type")
+            if r_type == "text" and hasattr(c, "chunk_id"):
+                key = c.chunk_id
+            elif r_type == "image" and isinstance(c, dict):
+                key = (c.get("file_name", ""), c.get("page", ""))
+            else:
+                continue
             if key in existing_ids:
                 continue
 
             # When a specific patient was requested, skip results that clearly
             # belong to a DIFFERENT patient (prevents cross-patient contamination).
             if active_patients:
-                if r["type"] == "text":
+                if r_type == "text":
                     result_patient = (getattr(c, "patient_name", "") or "").lower()
-                else:
+                elif isinstance(c, dict):
                     result_patient = (c.get("patient_name", "") or "").lower()
+                else:
+                    result_patient = ""
                 if result_patient and result_patient not in active_patients:
                     continue
 

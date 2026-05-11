@@ -1013,7 +1013,21 @@ def build_summary_prompt_and_sources(
     Pure function — no LLM call. Used by both the streaming and non-streaming
     summary helpers so the UI can show citation chips before tokens arrive.
     """
-    top_items = fused_results[:8]
+    def _wrap_chunk_like(item):
+        """Wrap a raw TreeChunk/TextChunk-like object as a fused-result dict."""
+        if isinstance(item, dict):
+            return item
+        if hasattr(item, "file_name") and hasattr(item, "text"):
+            return {"type": "text", "content": item, "final_score": 0.0}
+        return None
+
+    safe_items = []
+    for raw in (fused_results or [])[:8]:
+        norm = _wrap_chunk_like(raw)
+        if norm is None:
+            continue
+        safe_items.append(norm)
+    top_items = safe_items
     if not top_items:
         return "", []
 
