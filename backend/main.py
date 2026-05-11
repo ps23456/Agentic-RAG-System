@@ -72,7 +72,15 @@ async def lifespan(app: FastAPI):
     from backend.services.rag_service import rag
     tenant_store.initialize_schema()
     tenant_store.ensure_default_bootstrap(os.environ.get("BACKEND_API_KEY", "").strip())
+    try:
+        n = tenant_store.recover_stale_running_index_jobs()
+        if n:
+            logger.warning("recovered_stale_index_jobs count=%s", n)
+    except Exception as e:
+        logger.warning("recover_stale_index_jobs_failed: %s", e)
     rag.initialize()
+    from backend.services.index_job_worker import start_index_job_worker
+    start_index_job_worker()
     try:
         tenant_store.sync_local_uploads_for_owner(
             tenant_id="tenant_default",

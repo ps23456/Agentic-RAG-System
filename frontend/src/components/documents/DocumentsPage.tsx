@@ -16,6 +16,7 @@ import {
   listDocuments,
   uploadFiles,
   deleteDocument,
+  indexRequestAccepted,
   triggerReindexDocs,
   triggerReindexImages,
   getIndexInfo,
@@ -171,7 +172,7 @@ export function DocumentsPage({ onBack, onChatWithDoc, onExtractFields }: Props)
       images: indexInfo?.image_count ?? 0,
     };
     const resp = await triggerReindexDocs(files);
-    if (resp.status === "started") {
+    if (indexRequestAccepted(resp)) {
       setIndexingType("docs");
       // Fetch fresh status right away so the progress bar shows live backend state
       // instead of waiting for the 800ms poll.
@@ -188,7 +189,7 @@ export function DocumentsPage({ onBack, onChatWithDoc, onExtractFields }: Props)
       images: indexInfo?.image_count ?? 0,
     };
     const resp = await triggerReindexImages(files);
-    if (resp.status === "started") {
+    if (indexRequestAccepted(resp)) {
       setIndexingType("images");
       getIndexInfo().then(setIndexInfo).catch(() => {});
     }

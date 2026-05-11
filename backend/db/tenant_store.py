@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import mimetypes
 import os
 import secrets
@@ -248,6 +249,9 @@ class TenantStore:
                         details_json TEXT NOT NULL DEFAULT '{}',
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
+                        started_at TEXT,
+                        finished_at TEXT,
+                        error_message TEXT NOT NULL DEFAULT '',
                         FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
                         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
                     );
@@ -323,6 +327,11 @@ class TenantStore:
                     "tenant_settings",
                     "llm_mode",
                     "TEXT NOT NULL DEFAULT 'platform_default'",
+                )
+                self._ensure_column(conn, "index_jobs", "started_at", "TEXT")
+                self._ensure_column(conn, "index_jobs", "finished_at", "TEXT")
+                self._ensure_column(
+                    conn, "index_jobs", "error_message", "TEXT NOT NULL DEFAULT ''"
                 )
                 conn.commit()
 
@@ -1012,6 +1021,190 @@ class TenantStore:
                 )
                 conn.commit()
                 return sid
+
+    # ── Index jobs (Gap 2: durable queue + observability) ─────────────
+
+    def create_index_job(
+        self,
+        tenant_id: str,
+        user_id: str,
+        job_type: str,
+        details: dict | None = None,
+    ) -> str:
+        """Insert a queued index job. Returns job id (idx_...)."""
+        job_id = f"idx_{uuid.uuid4().hex[:16]}"
+        now = _utcnow_iso()
+        payload = json.dumps(details or {}, ensure_ascii=True)
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO index_jobs (
+                        id, tenant_id, user_id, job_type, status,
+                        details_json, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
+                    """,
+                    (job_id, tenant_id, user_id, job_type, payload, now, now),
+                )
+                conn.commit()
+        return job_id
+
+    def claim_next_index_job(self) -> dict | None:
+        """Atomically claim the oldest queued job (status -> running).
+
+        Returns a dict with id, tenant_id, user_id, job_type, details_json
+        or None if no work. Caller must invoke finish_index_job when done.
+        """
+        now = _utcnow_iso()
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT id, tenant_id, user_id, job_type, details_json
+                    FROM index_jobs
+                    WHERE status = 'queued'
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if not row:
+                    return None
+                cur = conn.execute(
+                    """
+                    UPDATE index_jobs
+                    SET status = 'running', started_at = ?, updated_at = ?
+                    WHERE id = ? AND status = 'queued'
+                    """,
+                    (now, now, row["id"]),
+                )
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    return None
+                conn.commit()
+                return {
+                    "id": row["id"],
+                    "tenant_id": row["tenant_id"],
+                    "user_id": row["user_id"],
+                    "job_type": row["job_type"],
+                    "details_json": row["details_json"] or "{}",
+                }
+
+    def finish_index_job(
+        self,
+        job_id: str,
+        *,
+        succeeded: bool,
+        error_message: str = "",
+    ) -> None:
+        """Mark a running job succeeded or failed."""
+        now = _utcnow_iso()
+        status = "succeeded" if succeeded else "failed"
+        err = (error_message or "")[:4000]
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE index_jobs
+                    SET status = ?, finished_at = ?, error_message = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status, now, err, now, job_id),
+                )
+                conn.commit()
+
+    def list_index_jobs(
+        self,
+        tenant_id: str,
+        user_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Recent jobs for this tenant/user (newest first)."""
+        lim = max(1, min(int(limit), 200))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, job_type, status, details_json, created_at, updated_at,
+                       started_at, finished_at, error_message
+                FROM index_jobs
+                WHERE tenant_id = ? AND user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (tenant_id, user_id, lim),
+            ).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            out.append(
+                {
+                    "id": r["id"],
+                    "job_type": r["job_type"],
+                    "status": r["status"],
+                    "details": json.loads(r["details_json"] or "{}"),
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
+                    "started_at": r["started_at"],
+                    "finished_at": r["finished_at"],
+                    "error_message": r["error_message"] or "",
+                }
+            )
+        return out
+
+    def recover_stale_running_index_jobs(self) -> int:
+        """Mark jobs stuck in `running` as failed (e.g. after process crash).
+
+        Call once at process startup before the worker thread starts.
+        Returns number of rows updated.
+        """
+        now = _utcnow_iso()
+        msg = "interrupted: server restarted while job was running"
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE index_jobs
+                    SET status = 'failed', finished_at = ?, error_message = ?, updated_at = ?
+                    WHERE status = 'running'
+                    """,
+                    (now, msg, now),
+                )
+                row = conn.execute("SELECT changes() AS c").fetchone()
+                conn.commit()
+        return int(row["c"]) if row else 0
+
+    def get_index_job_for_owner(
+        self,
+        tenant_id: str,
+        user_id: str,
+        job_id: str,
+    ) -> dict | None:
+        if not job_id:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, job_type, status, details_json, created_at, updated_at,
+                       started_at, finished_at, error_message
+                FROM index_jobs
+                WHERE id = ? AND tenant_id = ? AND user_id = ?
+                LIMIT 1
+                """,
+                (job_id, tenant_id, user_id),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "job_type": row["job_type"],
+            "status": row["status"],
+            "details": json.loads(row["details_json"] or "{}"),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "error_message": row["error_message"] or "",
+        }
 
     def debug_stats(self) -> dict[str, object]:
         """Return lightweight table counts for runtime diagnostics."""

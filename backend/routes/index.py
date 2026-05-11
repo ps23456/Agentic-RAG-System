@@ -2,7 +2,7 @@
 import threading
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from backend.security import require_scopes
 
@@ -28,14 +28,18 @@ def _normalize_filter(body: Optional[IndexRequest]) -> Optional[set[str]]:
 
 
 @router.post("/api/index")
-async def trigger_reindex(_auth = Depends(require_scopes("index:run"))):
-    """Re-index everything (docs + images)."""
-    from backend.services.rag_service import rag
-    if rag._indexing:
-        return {"status": "already_indexing"}
-    thread = threading.Thread(target=rag.reindex, daemon=True)
-    thread.start()
-    return {"status": "started"}
+async def trigger_reindex(auth=Depends(require_scopes("index:run"))):
+    """Re-index everything (docs + images).
+
+    Work is enqueued to the durable index job queue; poll
+    ``GET /api/index/jobs/{job_id}`` or ``GET /api/index/jobs`` for status.
+    """
+    from backend.db.tenant_store import tenant_store
+
+    job_id = tenant_store.create_index_job(
+        auth.tenant_id, auth.user_id, "reindex_full", {}
+    )
+    return {"status": "queued", "job_id": job_id}
 
 
 @router.post("/api/index/docs")
@@ -48,56 +52,24 @@ async def trigger_reindex_docs(
     Accepts optional JSON body: ``{ "files": ["foo.pdf", "bar.md"] }`` to index just
     those files. When omitted, performs a full incremental re-scan.
     """
-    from backend.services.rag_service import rag
     from backend.db.tenant_store import tenant_store
 
-    if rag._indexing:
-        return {"status": "already_indexing"}
     file_filter = _normalize_filter(body)
     customer_id = (body.customer_id.strip() if body and body.customer_id else "") or None
-    tenant_store.update_documents_index_status(
-        tenant_id=auth.tenant_id,
-        user_id=auth.user_id,
-        status="indexing",
-        customer_id=customer_id,
-        file_names=file_filter,
-        index_error="",
+    details: dict = {}
+    if customer_id:
+        details["customer_id"] = customer_id
+    if file_filter:
+        details["files"] = sorted(file_filter)
+    job_id = tenant_store.create_index_job(
+        auth.tenant_id, auth.user_id, "reindex_docs", details
     )
-
-    def _run():
-        try:
-            rag.reindex_docs(file_filter=file_filter)
-            if str(rag._index_status).startswith("error"):
-                tenant_store.update_documents_index_status(
-                    tenant_id=auth.tenant_id,
-                    user_id=auth.user_id,
-                    status="failed",
-                    customer_id=customer_id,
-                    file_names=file_filter,
-                    index_error=str(rag._index_status),
-                )
-            else:
-                tenant_store.update_documents_index_status(
-                    tenant_id=auth.tenant_id,
-                    user_id=auth.user_id,
-                    status="indexed",
-                    customer_id=customer_id,
-                    file_names=file_filter,
-                    index_error="",
-                )
-        except Exception as e:
-            tenant_store.update_documents_index_status(
-                tenant_id=auth.tenant_id,
-                user_id=auth.user_id,
-                status="failed",
-                customer_id=customer_id,
-                file_names=file_filter,
-                index_error=str(e),
-            )
-
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-    return {"status": "started", "targeted": bool(file_filter), "count": len(file_filter) if file_filter else 0}
+    return {
+        "status": "queued",
+        "job_id": job_id,
+        "targeted": bool(file_filter),
+        "count": len(file_filter) if file_filter else 0,
+    }
 
 
 @router.post("/api/index/images")
@@ -110,56 +82,51 @@ async def trigger_reindex_images(
     Accepts optional JSON body: ``{ "files": ["photo.png"] }`` to index just those
     files. When omitted, performs a full incremental re-scan.
     """
-    from backend.services.rag_service import rag
     from backend.db.tenant_store import tenant_store
 
-    if rag._indexing:
-        return {"status": "already_indexing"}
     file_filter = _normalize_filter(body)
     customer_id = (body.customer_id.strip() if body and body.customer_id else "") or None
-    tenant_store.update_documents_index_status(
-        tenant_id=auth.tenant_id,
-        user_id=auth.user_id,
-        status="indexing",
-        customer_id=customer_id,
-        file_names=file_filter,
-        index_error="",
+    details: dict = {}
+    if customer_id:
+        details["customer_id"] = customer_id
+    if file_filter:
+        details["files"] = sorted(file_filter)
+    job_id = tenant_store.create_index_job(
+        auth.tenant_id, auth.user_id, "reindex_images", details
     )
+    return {
+        "status": "queued",
+        "job_id": job_id,
+        "targeted": bool(file_filter),
+        "count": len(file_filter) if file_filter else 0,
+    }
 
-    def _run():
-        try:
-            rag.reindex_images(file_filter=file_filter)
-            if str(rag._index_status).startswith("error"):
-                tenant_store.update_documents_index_status(
-                    tenant_id=auth.tenant_id,
-                    user_id=auth.user_id,
-                    status="failed",
-                    customer_id=customer_id,
-                    file_names=file_filter,
-                    index_error=str(rag._index_status),
-                )
-            else:
-                tenant_store.update_documents_index_status(
-                    tenant_id=auth.tenant_id,
-                    user_id=auth.user_id,
-                    status="indexed",
-                    customer_id=customer_id,
-                    file_names=file_filter,
-                    index_error="",
-                )
-        except Exception as e:
-            tenant_store.update_documents_index_status(
-                tenant_id=auth.tenant_id,
-                user_id=auth.user_id,
-                status="failed",
-                customer_id=customer_id,
-                file_names=file_filter,
-                index_error=str(e),
-            )
 
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-    return {"status": "started", "targeted": bool(file_filter), "count": len(file_filter) if file_filter else 0}
+@router.get("/api/index/jobs")
+async def list_index_jobs(
+    limit: int = 50,
+    auth=Depends(require_scopes("index:run")),
+):
+    """List recent index jobs for the authenticated tenant/user."""
+    from backend.db.tenant_store import tenant_store
+
+    jobs = tenant_store.list_index_jobs(
+        auth.tenant_id, auth.user_id, limit=limit
+    )
+    return {"jobs": jobs}
+
+
+@router.get("/api/index/jobs/{job_id}")
+async def get_index_job(job_id: str, auth=Depends(require_scopes("index:run"))):
+    """Return one index job by id (404 if not owned by this caller)."""
+    from backend.db.tenant_store import tenant_store
+
+    row = tenant_store.get_index_job_for_owner(
+        auth.tenant_id, auth.user_id, job_id
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return row
 
 
 @router.get("/api/index/status")

@@ -220,6 +220,15 @@ export interface UploadResult {
   docs: string[];
   images_count: number;
   docs_count: number;
+  /** Present when backend auto-enqueues indexing after upload (Gap 2). */
+  auto_index_started?: boolean;
+  index_job_id?: string;
+}
+
+/** True when POST /api/index* accepted work (legacy `started`, queue `queued`). */
+export function indexRequestAccepted(resp: { status: string }): boolean {
+  const s = (resp.status || "").toLowerCase();
+  return s === "started" || s === "queued";
 }
 
 export async function uploadFiles(files: File[]): Promise<UploadResult> {
@@ -234,7 +243,7 @@ export async function uploadFiles(files: File[]): Promise<UploadResult> {
   return res.json();
 }
 
-export async function triggerReindex(): Promise<{ status: string }> {
+export async function triggerReindex(): Promise<{ status: string; job_id?: string }> {
   const res = await fetch(`${API}/api/index`, { method: "POST", headers: withAuthHeaders() });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
@@ -242,6 +251,7 @@ export async function triggerReindex(): Promise<{ status: string }> {
 
 export interface TriggerReindexResponse {
   status: string;
+  job_id?: string;
   targeted?: boolean;
   count?: number;
 }
