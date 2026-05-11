@@ -545,9 +545,12 @@ def _call_llm_stream(prompt: str, api_key: str, provider: str, max_tokens: int =
     """Stream LLM tokens for Groq and OpenAI. Yields str deltas.
 
     Gemini and other providers: yields the full response once (non-streaming fallback).
-    On any error, silently falls back to the non-streaming `_call_llm`.
+    On any error OR when the streaming endpoint silently produces no deltas,
+    falls back to the non-streaming `_call_llm` so the caller always gets a
+    response when one is available.
     """
     provider = (provider or "").strip().lower() or "groq"
+    yielded_any = False
     try:
         if provider == "groq":
             from groq import Groq
@@ -565,9 +568,14 @@ def _call_llm_stream(prompt: str, api_key: str, provider: str, max_tokens: int =
                 except Exception:
                     delta = None
                 if delta:
+                    yielded_any = True
                     yield delta
-            return
-        if provider == "openai":
+            if yielded_any:
+                return
+            # Stream completed silently (zero deltas). Drop through to the
+            # non-streaming fallback below.
+            logger.warning("Groq stream returned zero deltas; falling back to non-streaming")
+        elif provider == "openai":
             from openai import OpenAI
             client = OpenAI(api_key=api_key)
             stream = client.chat.completions.create(
@@ -583,8 +591,11 @@ def _call_llm_stream(prompt: str, api_key: str, provider: str, max_tokens: int =
                 except Exception:
                     delta = None
                 if delta:
+                    yielded_any = True
                     yield delta
-            return
+            if yielded_any:
+                return
+            logger.warning("OpenAI stream returned zero deltas; falling back to non-streaming")
     except Exception as e:
         # Groq rate-limit fallback: stream from OpenAI instead.
         if provider == "groq" and _is_groq_limit_error(e):
@@ -606,13 +617,19 @@ def _call_llm_stream(prompt: str, api_key: str, provider: str, max_tokens: int =
                         except Exception:
                             delta = None
                         if delta:
+                            yielded_any = True
                             yield delta
-                    return
+                    if yielded_any:
+                        return
                 except Exception as fb_err:
                     logger.warning("OpenAI streaming fallback failed: %s", fb_err)
         logger.warning("Streaming LLM call failed (%s); falling back to non-streaming: %s", provider, e)
 
-    # Final fallback: one-shot non-streaming.
+    # Final fallback: one-shot non-streaming. Reached when either the
+    # streaming attempt above raised, the stream yielded zero deltas, or
+    # the provider has no native streaming support.
+    if yielded_any:
+        return
     out = _call_llm(prompt, api_key, provider)
     if out:
         yield out

@@ -761,6 +761,21 @@ class RAGService:
             except Exception as e:
                 logger.warning("Summary streaming failed: %s", e)
 
+        # Last-resort fallback: if streaming produced no output but we have a
+        # real prompt + key (typical for the unscoped path where some Groq
+        # streams complete silently), run the non-streaming summarizer used by
+        # /api/chat and emit the result as one token. This guarantees the UI
+        # never sees an empty answer when the blocking path would succeed.
+        if not summary and prompt and ctx["llm_key"]:
+            try:
+                from retrieval.agentic_rag import _call_llm
+                fallback_summary = _call_llm(prompt, ctx["llm_key"], ctx["provider"])
+                if fallback_summary:
+                    summary = fallback_summary
+                    yield ("token", summary)
+            except Exception as e:
+                logger.warning("Non-streaming summary fallback failed: %s", e)
+
         if not summary and ctx["direct_answer"]:
             summary = ctx["direct_answer"]
             yield ("token", summary)
