@@ -704,6 +704,7 @@ def _fallback_plan(query: str, catalog: dict) -> dict:
             if values:
                 label = cat_key.replace("known_", "").replace("_", " ").title()
                 return {
+                    "reasoning": f"Detected a list-all request for {entity}; answering from catalog without vector search.",
                     "intent": "list_entities",
                     "search_queries": [f"{entity} name list", query],
                     "main_intent_keywords": [entity, "name", "list"],
@@ -762,6 +763,11 @@ def _fallback_plan(query: str, catalog: dict) -> dict:
     from .hybrid_fusion import _extract_query_phrases
     main_kw = _extract_query_phrases(query)
     return {
+        "reasoning": (
+            "Rule-based plan (no agent LLM or JSON parse failed): hybrid text+image retrieval "
+            f"with {len(queries[:3])} query variant(s)"
+            + (f", scoped to patient {patient_filter}." if patient_filter else ".")
+        ),
         "intent": "general_search",
         "search_queries": queries[:3],
         "main_intent_keywords": main_kw[:6] if main_kw else [],
@@ -1103,6 +1109,24 @@ def run_agentic_rag(
         search_queries = search_queries[:2]
 
     # Build understanding dict for UI display (agent understanding page)
+    reasoning_text = (plan.get("reasoning") or "").strip()
+    if not reasoning_text:
+        # LLM often omits "reasoning" even when the JSON plan is valid; the
+        # rule-based _fallback_plan historically had no field at all. Surface a
+        # short, stable explanation so chat/stream meta is never blank.
+        bits = [f"intent={intent}", f"scope={scope or 'unscoped'}"]
+        if plan_query_type:
+            bits.append(f"query_type={plan_query_type}")
+        if patient_filter:
+            bits.append(f"patient_filter={patient_filter}")
+        if query_filename:
+            bits.append(f"file_scope={query_filename}")
+        sq_bits = [str(s)[:120] for s in (search_queries or [])[:3] if s]
+        reasoning_text = (
+            "Retrieval strategy: " + ", ".join(bits)
+            + (". Search queries: " + " | ".join(sq_bits) if sq_bits else ".")
+        )
+
     understanding = {
         "intent": intent,
         "metadata_filter": metadata_filter,
@@ -1112,7 +1136,7 @@ def run_agentic_rag(
         "query_type": plan_query_type,
         "direct_answer": direct_answer,
         "target_attribute": target_attr,
-        "reasoning": plan.get("reasoning", ""),
+        "reasoning": reasoning_text,
     }
 
     retrieve_k = METADATA_DIVERSITY_CANDIDATES if METADATA_DIVERSITY_ENABLED else MULTIMODAL_HYBRID_TOP_K

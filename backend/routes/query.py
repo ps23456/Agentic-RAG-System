@@ -62,6 +62,7 @@ class QueryResponse(BaseModel):
     answer: str
     sources: list[QuerySource]
     intent: str = ""
+    reasoning: str = ""
     elapsed_ms: int = 0
 
 
@@ -117,6 +118,7 @@ async def query_endpoint(req: QueryRequest, auth=Depends(require_scopes("query:r
         answer=result.get("summary", ""),
         sources=_normalize_sources(result.get("sources", [])),
         intent=result.get("intent", ""),
+        reasoning=result.get("reasoning", ""),
         elapsed_ms=elapsed_ms,
     )
 
