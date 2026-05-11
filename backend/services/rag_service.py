@@ -427,8 +427,28 @@ class RAGService:
         )
         logger.info("[chat-timing] run_agentic_rag: %.2fs (fused=%d)", time.time() - t0, len(fused or []))
 
+        def _normalize_fused_item(item) -> dict | None:
+            """Normalize retrieval items to a stable dict shape.
+
+            Some code paths can return TreeChunk-like objects directly. Convert
+            those to text entries so downstream chat/stream logic can treat all
+            items uniformly.
+            """
+            if isinstance(item, dict):
+                return item
+            if hasattr(item, "file_name") and hasattr(item, "text"):
+                return {
+                    "type": "text",
+                    "content": item,
+                    "final_score": 0.0,
+                }
+            return None
+
         results: list[dict] = []
-        for r in (fused or [])[:25]:
+        for raw in (fused or [])[:25]:
+            r = _normalize_fused_item(raw)
+            if not r:
+                continue
             c = r.get("content")
             fn = getattr(c, "file_name", "") if hasattr(c, "file_name") else (c or {}).get("file_name", "")
             # Tenant guard for in-memory (BM25/verbatim) hits — Chroma's
@@ -460,6 +480,8 @@ class RAGService:
                     "section_title": getattr(content, "_section_title", "") or "",
                 })
             else:
+                if not isinstance(content, dict):
+                    continue
                 snippet_src = content.get("ocr_text", "") or content.get("auto_caption", "") or ""
                 results.append({
                     "type": "image",
@@ -504,7 +526,10 @@ class RAGService:
             score_sources = score_sources[:8]
 
         fused_map: dict[tuple, dict] = {}
-        for r in (fused or []):
+        for raw in (fused or []):
+            r = _normalize_fused_item(raw)
+            if not r:
+                continue
             c = r.get("content")
             if r.get("type") == "text" and hasattr(c, "file_name"):
                 key = (getattr(c, "file_name", ""), getattr(c, "page_number", None))
