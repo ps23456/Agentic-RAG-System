@@ -3,6 +3,12 @@ import type { ChatResponse, DocumentPage, FieldsExtractResponse, IndexInfo, Resu
 const API = "";
 const BACKEND_API_KEY = (import.meta.env.VITE_BACKEND_API_KEY as string | undefined)?.trim();
 
+/** Client-side mirror of backend upload caps; default off (set VITE_UPLOAD_ENFORCE_LIMITS=true). */
+const UPLOAD_LIMITS_CLIENT =
+  String(import.meta.env.VITE_UPLOAD_ENFORCE_LIMITS || "").toLowerCase() === "true";
+const CLIENT_MAX_UPLOAD_FILES = 3;
+const CLIENT_MAX_UPLOAD_BYTES = 30 * 1024 * 1024;
+
 function withAuthHeaders(headers?: HeadersInit): HeadersInit {
   const merged = new Headers(headers ?? {});
   if (BACKEND_API_KEY) {
@@ -223,6 +229,8 @@ export interface UploadResult {
   /** Present when backend auto-enqueues indexing after upload (Gap 2). */
   auto_index_started?: boolean;
   index_job_id?: string;
+  /** True when server-side UPLOAD_LIMITS_ENABLED is on. */
+  upload_limits_active?: boolean;
 }
 
 /** True when POST /api/index* accepted work (legacy `started`, queue `queued`). */
@@ -232,6 +240,20 @@ export function indexRequestAccepted(resp: { status: string }): boolean {
 }
 
 export async function uploadFiles(files: File[]): Promise<UploadResult> {
+  if (UPLOAD_LIMITS_CLIENT) {
+    if (files.length > CLIENT_MAX_UPLOAD_FILES) {
+      throw new Error(
+        `Too many files for one upload (max ${CLIENT_MAX_UPLOAD_FILES}). Choose fewer files or split into multiple uploads.`
+      );
+    }
+    for (const f of files) {
+      if (f.size > CLIENT_MAX_UPLOAD_BYTES) {
+        throw new Error(
+          `File too large: ${f.name} (${(f.size / (1024 * 1024)).toFixed(1)} MB). Max ${CLIENT_MAX_UPLOAD_BYTES / (1024 * 1024)} MB per file.`
+        );
+      }
+    }
+  }
   const form = new FormData();
   files.forEach((f) => form.append("files", f));
   const res = await fetch(`${API}/api/upload`, {

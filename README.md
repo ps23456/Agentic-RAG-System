@@ -119,6 +119,8 @@ Chat, documents, medical, upload, and fields routes live under `backend/routes/`
 
 | Doc | Topic |
 |-----|--------|
+| [docs/INTEGRATION.md](docs/INTEGRATION.md) | Partner integration (curl, scopes, Swagger, BYOK) |
+| [docs/API.md](docs/API.md) | Full HTTP API reference |
 | [docs/LLM_SETUP.md](docs/LLM_SETUP.md) | API keys and RAG / LLM usage |
 | [docs/BGE_M3_SETUP.md](docs/BGE_M3_SETUP.md) | BGE M3 embedding setup |
 | [docs/VECTOR_DB_GUIDE.md](docs/VECTOR_DB_GUIDE.md) | Chroma / vector configuration |

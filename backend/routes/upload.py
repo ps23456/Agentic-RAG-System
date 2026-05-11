@@ -17,6 +17,32 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".
 DOC_EXTENSIONS = {".pdf", ".md", ".txt", ".json"}
 ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS | DOC_EXTENSIONS
 
+# ---- Upload limits (off by default; set UPLOAD_LIMITS_ENABLED=true to enforce) ----
+
+
+def _upload_limits_enabled() -> bool:
+    return os.environ.get("UPLOAD_LIMITS_ENABLED", "false").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
+def _max_upload_files_per_request() -> int:
+    try:
+        n = int(os.environ.get("MAX_UPLOAD_FILES_PER_REQUEST", "3"))
+        return max(1, min(n, 50))
+    except ValueError:
+        return 3
+
+
+def _max_upload_bytes_per_file() -> int:
+    try:
+        n = int(os.environ.get("MAX_UPLOAD_BYTES_PER_FILE", str(30 * 1024 * 1024)))
+        return max(1024, min(n, 500 * 1024 * 1024))
+    except ValueError:
+        return 30 * 1024 * 1024
+
 
 def _auto_index_enabled() -> bool:
     """Auto-trigger docs+images indexing after upload (default on).
@@ -67,6 +93,19 @@ async def upload_files(
         customer_slug = "default"
     if any(ch in customer_slug for ch in ("/", "\\", "..")):
         raise HTTPException(status_code=400, detail="Invalid customer_id")
+
+    limits_on = _upload_limits_enabled()
+    max_files = _max_upload_files_per_request()
+    max_bytes = _max_upload_bytes_per_file()
+    if limits_on and len(files) > max_files:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Too many files in one upload (max {max_files} per request). "
+                "Split into multiple requests or disable UPLOAD_LIMITS_ENABLED."
+            ),
+        )
+
     uploads_root = rag.uploads_folder
     tenant_dir = os.path.join(uploads_root, auth.tenant_slug, auth.user_id, customer_slug)
     os.makedirs(tenant_dir, exist_ok=True)
@@ -87,6 +126,15 @@ async def upload_files(
         os.makedirs(doc_dir, exist_ok=True)
         path = os.path.join(doc_dir, safe_name)
         content = await f.read()
+        if limits_on and len(content) > max_bytes:
+            mb = max_bytes / (1024 * 1024)
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"File too large: {safe_name} ({len(content) / (1024 * 1024):.1f} MB). "
+                    f"Maximum is {mb:.0f} MB per file when upload limits are enabled."
+                ),
+            )
         with open(path, "wb") as out:
             out.write(content)
         mime = (f.content_type or "").strip() or (mimetypes.guess_type(safe_name)[0] or "")
@@ -137,4 +185,5 @@ async def upload_files(
         "docs_count": len(docs),
         "auto_index_started": auto_index_started,
         "index_job_id": index_job_id or "",
+        "upload_limits_active": limits_on,
     }
