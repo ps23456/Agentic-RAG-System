@@ -1,6 +1,7 @@
 """Singleton RAG service wrapping existing retrieval/indexing modules."""
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -135,12 +136,77 @@ class RAGService:
             target=_warm_reranker, daemon=True, name="reranker-warmup",
         ).start()
 
+    @staticmethod
+    def _aps_slug_match_score(slug: str, q_lower: str) -> int:
+        """Score how well an APS_<slug>.pdf basename matches words in the query (lowercased)."""
+        slug = (slug or "").strip()
+        if not slug:
+            return 0
+        tokens: list[str] = []
+        m = re.match(r"^([A-Z]+)([A-Z][a-z][a-z]*)$", slug)
+        if m:
+            initials, rest = m.groups()
+            tokens.append(rest.lower())
+            if len(initials) == 1:
+                tokens.append(initials.lower())
+        else:
+            tokens.append(slug.lower())
+        score = 0
+        for t in tokens:
+            if len(t) >= 3 and t in q_lower:
+                score += len(t)
+        sl = slug.lower()
+        if len(sl) >= 4 and sl in q_lower:
+            score = max(score, len(sl))
+        return score
+
+    def _infer_medical_aps_pdf_from_query(
+        self,
+        query: str,
+        allowed_files: set[str] | None,
+    ) -> str | None:
+        """Heuristic: Teresa Brown -> APS_TBrown.pdf, Jennifer Mitchell -> APS_Mitchell.pdf."""
+        if not query or not allowed_files:
+            return None
+        q_lower = query.lower()
+        best_fname: str | None = None
+        best_score = 0
+        for fname in allowed_files:
+            if not fname:
+                continue
+            fn = fname.strip()
+            if not fn.upper().startswith("APS_") or not fn.lower().endswith(".pdf"):
+                continue
+            slug = os.path.splitext(fn[4:])[0]
+            sc = self._aps_slug_match_score(slug, q_lower)
+            if sc > best_score:
+                best_score = sc
+                best_fname = fn
+        return best_fname if best_score >= 4 else None
+
+    @staticmethod
+    def _query_suggests_medical_patient_context(q_lower: str) -> bool:
+        """Avoid APS_<slug>.pdf heuristics on arbitrary prose (e.g. 'brown leather')."""
+        cues = (
+            "patient", "hour", "hours", "stand", "walk", "sit", "lift", "carry",
+            "claim", "diagnosis", "injury", "medical", "physician", "disability",
+            "aps", "evaluation", "capacity", "restriction", "limitations",
+            "insured", "benefits", "policy", "form",
+        )
+        return any(c in q_lower for c in cues)
+
     def get_patients(self) -> list[str]:
         if not self.search_index or not hasattr(self.search_index, "chunks"):
             return []
         try:
-            from retrieval.agentic_rag import get_robust_catalog
-            catalog = get_robust_catalog(self.search_index.chunks)
+            from retrieval.agentic_rag import (
+                augment_catalog_with_image_patients,
+                get_robust_catalog,
+            )
+
+            catalog = augment_catalog_with_image_patients(
+                get_robust_catalog(self.search_index.chunks)
+            )
             return catalog.get("known_patients", [])
         except Exception:
             return []
@@ -169,9 +235,10 @@ class RAGService:
         inferred_file: str | None = None
         try:
             from retrieval.agentic_rag import (
-                _resolve_query_filename,
                 _extract_query_filename,
+                _resolve_query_filename,
             )
+
             inferred_file = _resolve_query_filename(q, allowed_files=allowed_files)
             if not inferred_file:
                 inferred_file = _extract_query_filename(q)
@@ -188,6 +255,13 @@ class RAGService:
             if p_low.replace(" ", "") in q_lower.replace(" ", ""):
                 inferred_patient = p
                 break
+
+        if (
+            not inferred_file
+            and allowed_files
+            and (inferred_patient or self._query_suggests_medical_patient_context(q_lower))
+        ):
+            inferred_file = self._infer_medical_aps_pdf_from_query(q, allowed_files)
 
         return inferred_patient, inferred_file
 
@@ -365,7 +439,9 @@ class RAGService:
         t0 = time.time()
         text_retriever = TextRetriever(self.search_index)
         image_retriever = ImageRetriever()
-        catalog = get_robust_catalog(self.search_index.chunks)
+        catalog = augment_catalog_with_image_patients(
+            get_robust_catalog(self.search_index.chunks)
+        )
         logger.info("[chat-timing] init+catalog: %.2fs", time.time() - t0)
 
         effective_patient_filter = patient_filter
@@ -408,7 +484,7 @@ class RAGService:
             user_meta["tenant_id"] = tenant_id
 
         llm_key, provider = self._tenant_llm_config(tenant_id)
-        scoped_fast_mode = bool(effective_file_filter) or bool(allowed_files and len(allowed_files) <= 8)
+        scoped_fast_mode = bool(effective_file_filter)
         use_llm_for_retrieval = bool(llm_key) and not scoped_fast_mode
 
         t0 = time.time()

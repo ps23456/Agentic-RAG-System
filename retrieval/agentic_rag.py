@@ -387,6 +387,56 @@ def get_robust_catalog(chunks: list) -> dict:
     }
 
 
+def augment_catalog_with_image_patients(catalog: dict | None) -> dict:
+    """Merge patient names from the image Chroma collection into the text-derived catalog.
+
+    Text chunks often omit patient headers that exist only on scanned APS PDF pages indexed
+    as images; without this, ``known_patients`` misses people like Teresa Brown so indirect
+    queries get no patient filter and retrieval can latch onto another patient's APS PDF.
+    """
+    base = dict(catalog or {})
+    patient_counts: dict[str, int] = {}
+    for p in base.get("known_patients") or []:
+        pn = _normalize_name((p or "").strip())
+        if pn:
+            patient_counts[pn] = patient_counts.get(pn, 0) + 5
+
+    try:
+        import chromadb
+        from chromadb.config import Settings
+        from config import CHROMA_PERSIST_DIR, CHROMA_IMAGE_COLLECTION_NAME
+
+        if os.path.isdir(CHROMA_PERSIST_DIR):
+            client = chromadb.PersistentClient(
+                path=CHROMA_PERSIST_DIR,
+                settings=Settings(anonymized_telemetry=False),
+            )
+            coll = client.get_or_create_collection(
+                name=CHROMA_IMAGE_COLLECTION_NAME,
+                metadata={"hnsw:space": "cosine"},
+            )
+            res = coll.get(include=["metadatas"])
+            for m in res.get("metadatas") or []:
+                if not m:
+                    continue
+                pn = _normalize_name((m.get("patient_name") or "").strip())
+                if pn:
+                    patient_counts[pn] = patient_counts.get(pn, 0) + 4
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug(
+            "augment_catalog_with_image_patients skipped: %s", e
+        )
+
+    if not patient_counts:
+        return base
+
+    known_patients, patient_name_aliases = _merge_similar_patient_names(patient_counts)
+    base["known_patients"] = known_patients
+    base["patient_name_aliases"] = patient_name_aliases
+    return base
+
+
 def _get_document_context(chunks: list, max_chunks: int = 8) -> str:
     """Build a representative sample of document content for the LLM."""
     if not chunks:
@@ -641,12 +691,31 @@ def _parse_llm_plan(raw: str | None) -> dict | None:
         return None
     cleaned = re.sub(r"^```\w*\n?", "", raw.strip())
     cleaned = re.sub(r"\n?```\s*$", "", cleaned).strip()
-    try:
-        plan = json.loads(cleaned)
-        if isinstance(plan.get("search_queries"), list) and plan["search_queries"]:
-            return plan
-    except json.JSONDecodeError:
-        pass
+    candidates = [cleaned]
+    # LLMs often wrap JSON in prose; extract the first top-level {...} block.
+    start = cleaned.find("{")
+    if start >= 0:
+        depth = 0
+        end = -1
+        for i in range(start, len(cleaned)):
+            ch = cleaned[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end > start:
+            candidates.append(cleaned[start : end + 1].strip())
+
+    for cand in candidates:
+        try:
+            plan = json.loads(cand)
+            if isinstance(plan, dict) and isinstance(plan.get("search_queries"), list) and plan["search_queries"]:
+                return plan
+        except json.JSONDecodeError:
+            continue
     return None
 
 
@@ -691,6 +760,25 @@ def _fallback_plan(query: str, catalog: dict) -> dict:
     """
     q_lower = (query or "").strip().lower()
     queries = [query]
+
+    # Universal semantic assist for no-LLM / parse-fail path:
+    # add compact intent variants from meaningful words and phrases.
+    stop = {
+        "what", "when", "where", "which", "who", "whom", "why", "how",
+        "is", "are", "was", "were", "do", "does", "did", "can", "could",
+        "would", "should", "tell", "show", "give", "find", "about", "from",
+        "for", "the", "this", "that", "with", "and", "or", "in", "on", "to",
+        "of", "a", "an", "me", "my", "we", "our", "you", "your",
+    }
+    q_words = [w for w in re.findall(r"[a-z0-9]{3,}", q_lower) if w not in stop]
+    if q_words:
+        # Main lexical probe (helps BM25 across PDF/MD/image OCR).
+        queries.append(" ".join(q_words[:8]))
+        # Feature-style probe catches product capability questions ("pangram features").
+        if "feature" in q_lower or "capabilit" in q_lower or "function" in q_lower:
+            subject = " ".join(w for w in q_words if w not in {"feature", "features", "capability", "capabilities", "function", "functions"})
+            if subject:
+                queries.append(f"{subject} features capabilities overview")
 
     # Check if listing entities
     list_words = ["list", "show", "all", "every", "existing", "who are", "name",
@@ -762,18 +850,32 @@ def _fallback_plan(query: str, catalog: dict) -> dict:
 
     from .hybrid_fusion import _extract_query_phrases
     main_kw = _extract_query_phrases(query)
+    # Deduplicate while preserving order.
+    deduped: list[str] = []
+    seen_q: set[str] = set()
+    for qv in queries:
+        s = (qv or "").strip()
+        if not s:
+            continue
+        k = s.lower()
+        if k in seen_q:
+            continue
+        seen_q.add(k)
+        deduped.append(s)
+
     return {
         "reasoning": (
             "Rule-based plan (no agent LLM or JSON parse failed): hybrid text+image retrieval "
-            f"with {len(queries[:3])} query variant(s)"
+            f"with {len(deduped[:4])} query variant(s)"
             + (f", scoped to patient {patient_filter}." if patient_filter else ".")
         ),
         "intent": "general_search",
-        "search_queries": queries[:3],
+        "search_queries": deduped[:4],
         "main_intent_keywords": main_kw[:6] if main_kw else [],
         "scope": "all_patients" if "all" in q_lower or "every" in q_lower or "each" in q_lower or "patients" in q_lower else "unscoped",
         "patient_filter": patient_filter,
-        "query_type": "text_heavy",
+        # Keep multimodal behavior in fallback; text_heavy drops image-only rows.
+        "query_type": "hybrid",
         "direct_answer": None,
         "target_attribute": None,
     }
@@ -1047,9 +1149,9 @@ def run_agentic_rag(
 
     MIN_RESULTS = 3
 
-    # Step 1: Build context for the agent
+    # Step 1: Build context for the agent (text chunks + image-index patient metadata)
     robust_catalog = get_robust_catalog(index.chunks) if index and index.chunks else {}
-    catalog_final = robust_catalog if robust_catalog.get("known_patients") else catalog or {}
+    catalog_final = augment_catalog_with_image_patients(robust_catalog)
 
     # Step 2: Let the LLM think (or fall back to rules)
     plan = None
