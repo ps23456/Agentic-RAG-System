@@ -546,6 +546,30 @@ def _needs_ocr(text: str, min_chars: int = 50) -> bool:
     return len(cleaned) < min_chars
 
 
+def _looks_like_form_template_text(text: str) -> bool:
+    """Detect checkbox/form pages where embedded text exists but values are visual.
+
+    These pages often contain labels (e.g. "PHYSICAL CAPACITIES EVALUATION") so
+    `_needs_ocr()` returns False, yet the actual answers are only visible in
+    checkmarks/handwriting. For such pages we should still run OCR.
+    """
+    t = re.sub(r"\s+", " ", (text or "").lower())
+    if not t:
+        return False
+    cues = (
+        "physical capacities evaluation",
+        "hours at one time",
+        "total hours during the day",
+        "activity restrictions involving",
+        "patient can stand",
+        "patient can walk",
+        "patient can sit",
+        "patient can drive",
+    )
+    hit = sum(1 for c in cues if c in t)
+    return hit >= 2
+
+
 def extract_text_from_pdf_page(path: str, page_num: int) -> str:
     """
     Extract text from a single PDF page. Uses PyMuPDF first (fast); if empty or very short,
@@ -679,10 +703,15 @@ def _ocr_image_pages(path: str) -> List[tuple[int, str]]:
 
 def extract_text_from_pdf(path: str) -> List[tuple[int, str]]:
     """
-    Extract text from PDF. Priority: pdfplumber → PyMuPDF → Mistral OCR → Tesseract.
+    Extract text from PDF.
+    Priority (when key is present): Mistral OCR first, then local extraction fallback.
+    Without key: pdfplumber → PyMuPDF → Tesseract.
     For large structured PDFs, prefer the companion .md file (pre-converted via Mistral OCR).
     Returns [(page_number, text), ...].
     """
+    # Ensure key is picked up even in non-Streamlit/CLI contexts.
+    _ensure_mistral_key_from_env()
+
     # 0. If a pre-converted markdown companion file exists, skip PDF extraction entirely.
     # e.g. pnb.md is the Mistral-OCR output for PNB AR 2024-25_Web.pdf
     md_companion = os.path.splitext(path)[0] + ".md"
@@ -690,15 +719,25 @@ def extract_text_from_pdf(path: str) -> List[tuple[int, str]]:
         logger.info("Using pre-converted markdown companion for %s: %s", os.path.basename(path), md_companion)
         return extract_text_from_markdown(md_companion)
 
+    # 0.5 Mistral-first mode: on every upload/index pass, attempt full-document
+    # cloud OCR when key is available. This captures form checkboxes/handwriting
+    # that native PDF text extraction misses.
+    if _MISTRAL_OCR_KEY and not _is_mistral_disabled():
+        mistral_pages = _mistral_ocr_pdf(path)
+        if mistral_pages:
+            return mistral_pages
+        logger.warning(
+            "Mistral OCR returned empty for %s; falling back to local PDF extraction/OCR.",
+            os.path.basename(path),
+        )
+
     # 1. Try internal text extraction first (Small docs)
     pages = _extract_text_pdfplumber(path)
     if not pages:
         pages = _extract_text_pymupdf(path)
     
     if not pages:
-        # No text content at all (broken PDF or purely image-based), try full document Mistral OCR
-        if _MISTRAL_OCR_KEY:
-            return _mistral_ocr_pdf(path)
+        # No text content at all and either Mistral key is unavailable or Mistral returned empty.
         return []
 
     # 2. Check how many pages need OCR
@@ -730,6 +769,23 @@ def extract_text_from_pdf(path: str) -> List[tuple[int, str]]:
                 ocr_text = _ocr_pdf_page(path, page_num)
                 result.append((page_num, ocr_text if ocr_text else text))
         else:
+            # Important: many insurance/medical forms contain embedded template text
+            # but the real values live in visual checkboxes/handwriting. Run Mistral
+            # OCR on these pages too, then append OCR output so retrieval can match
+            # concrete values (e.g. checked "4 hours").
+            if _MISTRAL_OCR_KEY and not _is_mistral_disabled():
+                if _should_force_mistral_ocr(path) or _looks_like_form_template_text(text):
+                    ocr_text = _mistral_ocr_pdf_page_render(path, page_num)
+                    if ocr_text.strip():
+                        base = text or ""
+                        # Keep native PDF text (clean headings) and append OCR detail.
+                        merged = (
+                            base + "\n\n[OCR overlay]\n" + ocr_text
+                            if ocr_text not in base
+                            else base
+                        )
+                        result.append((page_num, merged))
+                        continue
             result.append((page_num, text))
     return result
 
