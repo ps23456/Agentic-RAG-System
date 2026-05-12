@@ -11,6 +11,7 @@ The LLM decides everything; rule-based is fallback only when no API key.
 import json
 import os
 import re
+import ast
 from difflib import SequenceMatcher
 from typing import Any, List, Tuple, Optional
 
@@ -715,7 +716,13 @@ def _parse_llm_plan(raw: str | None) -> dict | None:
             if isinstance(plan, dict) and isinstance(plan.get("search_queries"), list) and plan["search_queries"]:
                 return plan
         except json.JSONDecodeError:
-            continue
+            # Some models return Python-dict-like text with single quotes.
+            try:
+                plan = ast.literal_eval(cand)
+                if isinstance(plan, dict) and isinstance(plan.get("search_queries"), list) and plan["search_queries"]:
+                    return plan
+            except Exception:
+                continue
     return None
 
 
@@ -1163,6 +1170,37 @@ def run_agentic_rag(
         prompt = _build_agent_prompt(query, catalog_final, doc_context)
         raw = _call_llm(prompt, api_key, provider)
         plan = _parse_llm_plan(raw)
+        # If the planner answer is non-JSON in production, don't immediately
+        # degrade to rule-only retrieval. Reuse the robust query-understanding
+        # LLM path as a bridge plan so indirect semantic queries remain strong.
+        if not plan:
+            try:
+                from .llm_query_understanding import understand_query_llm
+
+                uq = understand_query_llm(
+                    query=query,
+                    catalog=catalog_final or {},
+                    api_key=api_key,
+                    provider=provider,
+                ) or {}
+                search_query = (uq.get("search_query") or query or "").strip() or query
+                patient_from_meta = (uq.get("metadata_filter") or {}).get("patient_name")
+                plan = {
+                    "reasoning": (
+                        "Fallback bridge: planner JSON parse failed, reused "
+                        "LLM query-understanding strategy."
+                    ),
+                    "intent": uq.get("intent") or "general_search",
+                    "search_queries": [search_query, query][:2],
+                    "main_intent_keywords": [],
+                    "scope": "specific_patient" if patient_from_meta else "unscoped",
+                    "patient_filter": patient_from_meta or None,
+                    "query_type": "hybrid",
+                    "direct_answer": uq.get("direct_answer"),
+                    "target_attribute": uq.get("target_attribute"),
+                }
+            except Exception:
+                plan = None
 
     if not plan:
         plan = _fallback_plan(query, catalog_final)

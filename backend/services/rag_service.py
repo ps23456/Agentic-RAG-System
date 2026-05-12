@@ -205,6 +205,9 @@ class RAGService:
             "give", "find", "about", "that", "this", "have", "has", "had", "does",
             "did", "can", "could", "would", "should", "your", "our", "their", "there",
             "into", "over", "under", "than", "then", "also", "please",
+            # Generic query filler terms that should not drive file-level boosts.
+            "key", "keys", "feature", "features", "info", "information", "details",
+            "summary", "summarize", "explain", "topic",
         }
         out: list[str] = []
         for w in words:
@@ -255,7 +258,10 @@ class RAGService:
         for fn, st in file_stats.items():
             hit_ratio = min(1.0, float(st["hits"]) / max(1.0, float(len(tokens))))
             strong_ratio = min(1.0, float(st["strong_hits"]) / max(1.0, float(len(tokens))))
-            support_bonus = min(0.15, 0.04 * max(0, int(st["support"]) - 1))
+            # Only reward multi-hit support when file already has meaningful lexical match.
+            support_bonus = 0.0
+            if hit_ratio >= 0.34 or strong_ratio >= 0.25:
+                support_bonus = min(0.15, 0.04 * max(0, int(st["support"]) - 1))
             exact_bonus = 0.18 if st["exact"] else 0.0
             file_bonus[fn] = (0.35 * hit_ratio) + (0.22 * strong_ratio) + support_bonus + exact_bonus
 
@@ -331,10 +337,21 @@ class RAGService:
                 inferred_patient = p
                 break
 
+        # Do NOT force file scope for generic patient questions; that can hide
+        # better evidence from allied files (e.g. OCR/markdown summaries).
+        # Apply APS file inference only when query explicitly signals form/page scope.
+        explicit_form_scope = (
+            "aps" in q_lower
+            or "form" in q_lower
+            or "page" in q_lower
+            or "image" in q_lower
+        )
         if (
             not inferred_file
             and allowed_files
-            and (inferred_patient or self._query_suggests_medical_patient_context(q_lower))
+            and inferred_patient
+            and explicit_form_scope
+            and self._query_suggests_medical_patient_context(q_lower)
         ):
             inferred_file = self._infer_medical_aps_pdf_from_query(q, allowed_files)
 
