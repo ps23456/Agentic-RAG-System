@@ -103,6 +103,7 @@ CHROMA_COLLECTION_NAME = "claim_chunks"
 
 # BGE Reranker: second-stage reranking of hybrid results (query + passage -> score).
 # Uses sentence-transformers CrossEncoder; first load may download the model.
+RERANKER_MODEL = os.environ.get("RERANKER_MODEL", "BAAI/bge-reranker-base")
 # How many candidates to pass to the reranker. Tuned down from 80 -> 30 because:
 #   (a) BM25+vector RRF upstream already filters weak matches,
 #   (b) BGE rerank quality on 25-30 candidates is statistically ~equal to 80,
