@@ -1,6 +1,21 @@
 """Configuration for Insurance Claim Search."""
 import os
 
+
+def _env_int(name: str, default: int) -> int:
+    """Parse int from env; empty or invalid values fall back to default (avoids startup crash)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    s = str(raw).strip()
+    if not s:
+        return default
+    try:
+        return int(s)
+    except ValueError:
+        return default
+
+
 # Data source: local folder only
 DATA_FOLDER = os.environ.get("CLAIM_SEARCH_DATA", os.path.join(os.path.dirname(__file__), "data"))
 # Subfolder under data folder where uploaded files are stored
@@ -44,12 +59,12 @@ MIN_CHUNK_CHARS = 50
 # Structured document chunking (auto-detected: text-rich PDFs with headings, e.g. annual reports).
 # Default 16 aligns with MISTRAL_OCR_MAX_PAGES: PDFs with >15 pages skip Mistral and rely on
 # native extraction + hierarchical section chunking + page-tree retrieval instead.
-STRUCTURED_DOC_MIN_PAGES = int(os.environ.get("STRUCTURED_DOC_MIN_PAGES", "16"))
+STRUCTURED_DOC_MIN_PAGES = _env_int("STRUCTURED_DOC_MIN_PAGES", 16)
 
 # Mistral full/per-page OCR applies only when PDF page count is <= this value (cost/latency).
 # Larger PDFs: pdfplumber/PyMuPDF/Tesseract only; structured chunking + trees handle navigation.
 # Override per file via sidecar .mistralocr or MISTRAL_OCR_FORCE_FILENAMES (see document_loader).
-MISTRAL_OCR_MAX_PAGES = int(os.environ.get("MISTRAL_OCR_MAX_PAGES", "15"))
+MISTRAL_OCR_MAX_PAGES = _env_int("MISTRAL_OCR_MAX_PAGES", 15)
 STRUCTURED_DOC_TEXT_RATIO = 0.80     # 80%+ pages must have extractable text to qualify
 STRUCTURED_MAX_CHUNK_CHARS = 50000   # large section-based chunks
 STRUCTURED_SKIP_RERANKER = True      # skip BGE CrossEncoder reranker for structured-doc results
