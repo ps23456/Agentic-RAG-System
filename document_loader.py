@@ -11,7 +11,12 @@ from typing import List, Iterator, Callable, Optional
 import pdfplumber
 import fitz  # PyMuPDF for fallback and page images for OCR
 import json
-from config import DATA_FOLDER, MISTRAL_OCR_FORCE_FILENAMES, STRUCTURED_DOC_MIN_PAGES
+from config import (
+    DATA_FOLDER,
+    MISTRAL_OCR_FORCE_FILENAMES,
+    MISTRAL_OCR_MAX_PAGES,
+    STRUCTURED_DOC_MIN_PAGES,
+)
 
 # Lazy OCR: don't import pytesseract at module level (it can crash the process on some systems).
 # We'll try to enable OCR when first needed.
@@ -160,6 +165,44 @@ def _mistral_ocr_pdf_page_render(path: str, page_num: int) -> str:
 
 def get_mistral_ocr_key() -> str:
     return _MISTRAL_OCR_KEY
+
+
+# One upload job runs text chunking, page-tree build, then image indexing. Without a
+# cache, the same PDF hits Mistral/OCR twice (chunks + trees) and image indexing
+# would repeat work. Keyed by (realpath, mtime); invalidated when the file changes.
+_PDF_EXTRACT_CACHE: dict[tuple[str, float], tuple[list[tuple[int, str]], str]] = {}
+
+
+def _pdf_extract_cache_key(path: str) -> tuple[str, float] | None:
+    try:
+        if not os.path.isfile(path):
+            return None
+        return (os.path.realpath(path), os.path.getmtime(path))
+    except OSError:
+        return None
+
+
+def _pdf_extract_cache_get(path: str, mistral_first: bool) -> list[tuple[int, str]] | None:
+    key = _pdf_extract_cache_key(path)
+    if not key or key not in _PDF_EXTRACT_CACHE:
+        return None
+    pages, quality = _PDF_EXTRACT_CACHE[key]
+    if not pages or not any((t or "").strip() for _, t in pages):
+        return None
+    if not mistral_first:
+        return list(pages)
+    if quality in ("mistral_full", "md_companion", "mixed"):
+        return list(pages)
+    return None
+
+
+def _pdf_extract_cache_set(path: str, pages: List[tuple[int, str]], quality: str) -> None:
+    key = _pdf_extract_cache_key(path)
+    if not key or not pages:
+        return
+    if not any((t or "").strip() for _, t in pages):
+        return
+    _PDF_EXTRACT_CACHE[key] = (list(pages), quality)
 
 
 def _mistral_ocr_pdf(path: str) -> List[tuple[int, str]]:
@@ -708,23 +751,53 @@ def extract_text_from_pdf(path: str, mistral_first: bool = True) -> List[tuple[i
     Without key: pdfplumber → PyMuPDF → Tesseract.
     For large structured PDFs, prefer the companion .md file (pre-converted via Mistral OCR).
     Returns [(page_number, text), ...].
+
+    Results are cached in-process per (resolved path, mtime) so a single upload job does not
+    re-run Mistral for chunking, page-tree build, and image indexing paths.
+
+    PDFs with more than ``MISTRAL_OCR_MAX_PAGES`` (default 15) skip all Mistral OCR unless the
+    file is forced (sidecar ``.mistralocr`` or ``MISTRAL_OCR_FORCE_FILENAMES``). Those documents
+    use native extraction + Tesseract and downstream structured chunking / page trees.
     """
     # Ensure key is picked up even in non-Streamlit/CLI contexts.
     _ensure_mistral_key_from_env()
+
+    cached = _pdf_extract_cache_get(path, mistral_first)
+    if cached is not None:
+        logger.debug("PDF extract cache hit: %s", os.path.basename(path))
+        return cached
 
     # 0. If a pre-converted markdown companion file exists, skip PDF extraction entirely.
     # e.g. pnb.md is the Mistral-OCR output for PNB AR 2024-25_Web.pdf
     md_companion = os.path.splitext(path)[0] + ".md"
     if os.path.exists(md_companion):
         logger.info("Using pre-converted markdown companion for %s: %s", os.path.basename(path), md_companion)
-        return extract_text_from_markdown(md_companion)
+        md_pages = extract_text_from_markdown(md_companion)
+        _pdf_extract_cache_set(path, md_pages, "md_companion")
+        return md_pages
+
+    page_total = _pdf_page_count(path)
+    mistral_allowed_by_size = page_total <= MISTRAL_OCR_MAX_PAGES or _should_force_mistral_ocr(path)
+    if page_total > MISTRAL_OCR_MAX_PAGES and not _should_force_mistral_ocr(path):
+        logger.info(
+            "PDF %s has %d pages (> %d): skipping Mistral OCR; local extract + structured/tree indexing.",
+            os.path.basename(path),
+            page_total,
+            MISTRAL_OCR_MAX_PAGES,
+        )
 
     # 0.5 Mistral-first mode: on every upload/index pass, attempt full-document
     # cloud OCR when key is available. This captures form checkboxes/handwriting
     # that native PDF text extraction misses.
-    if mistral_first and _MISTRAL_OCR_KEY and not _is_mistral_disabled():
+    if (
+        mistral_allowed_by_size
+        and mistral_first
+        and _MISTRAL_OCR_KEY
+        and not _is_mistral_disabled()
+    ):
         mistral_pages = _mistral_ocr_pdf(path)
         if mistral_pages:
+            _pdf_extract_cache_set(path, mistral_pages, "mistral_full")
             return mistral_pages
         logger.warning(
             "Mistral OCR returned empty for %s; falling back to local PDF extraction/OCR.",
@@ -740,18 +813,21 @@ def extract_text_from_pdf(path: str, mistral_first: bool = True) -> List[tuple[i
         # No text content at all and either Mistral key is unavailable or Mistral returned empty.
         return []
 
-    # 2. Check how many pages need OCR
-    pages_needing_ocr = [p_num for p_num, text in pages if _needs_ocr(text)]
-    
-    # If more than 90% of pages have NO text content, try full document Mistral OCR
+    # 2. If more than 90% of pages have NO text content, try full document Mistral OCR
     # (High threshold: if even 10% have text, we prefer page-by-page local/selective OCR)
     zero_text_pages = [p_num for p_num, text in pages if not text.strip()]
     ratio_zero_text = len(zero_text_pages) / len(pages)
     
-    if ratio_zero_text > 0.9 and _MISTRAL_OCR_KEY and not _is_mistral_disabled():
+    if (
+        mistral_allowed_by_size
+        and ratio_zero_text > 0.9
+        and _MISTRAL_OCR_KEY
+        and not _is_mistral_disabled()
+    ):
         # Document is almost entirely scanned/image based, use Mistral for global extraction
         mistral_pages = _mistral_ocr_pdf(path)
         if mistral_pages:
+            _pdf_extract_cache_set(path, mistral_pages, "mistral_full")
             return mistral_pages
 
     # 3. Process page-by-page (Mixed extraction)
@@ -760,7 +836,12 @@ def extract_text_from_pdf(path: str, mistral_first: bool = True) -> List[tuple[i
         if _needs_ocr(text):
             # Try Mistral for this specific page if doc is small, else fallback to local Tesseract
             # Cloud OCR on every page of a large doc is too slow/expensive
-            if _MISTRAL_OCR_KEY and not _is_mistral_disabled() and len(pages) < 10:
+            if (
+                mistral_allowed_by_size
+                and _MISTRAL_OCR_KEY
+                and not _is_mistral_disabled()
+                and len(pages) < 10
+            ):
                 ocr_text = _mistral_ocr_pdf_page_render(path, page_num)
                 if not ocr_text.strip():
                     ocr_text = _ocr_pdf_page(path, page_num)
@@ -773,7 +854,7 @@ def extract_text_from_pdf(path: str, mistral_first: bool = True) -> List[tuple[i
             # but the real values live in visual checkboxes/handwriting. Run Mistral
             # OCR on these pages too, then append OCR output so retrieval can match
             # concrete values (e.g. checked "4 hours").
-            if _MISTRAL_OCR_KEY and not _is_mistral_disabled():
+            if mistral_allowed_by_size and _MISTRAL_OCR_KEY and not _is_mistral_disabled():
                 if _should_force_mistral_ocr(path) or _looks_like_form_template_text(text):
                     ocr_text = _mistral_ocr_pdf_page_render(path, page_num)
                     if ocr_text.strip():
@@ -787,6 +868,8 @@ def extract_text_from_pdf(path: str, mistral_first: bool = True) -> List[tuple[i
                         result.append((page_num, merged))
                         continue
             result.append((page_num, text))
+    q = "mixed" if (_MISTRAL_OCR_KEY and not _is_mistral_disabled()) else "local"
+    _pdf_extract_cache_set(path, result, q)
     return result
 
 

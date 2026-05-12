@@ -41,8 +41,15 @@ CHUNK_BY = "paragraph"  # or "page"
 MAX_CHUNK_CHARS = 1500
 MIN_CHUNK_CHARS = 50
 
-# Structured document chunking (auto-detected: text-rich PDFs with headings, e.g. annual reports)
-STRUCTURED_DOC_MIN_PAGES = 20        # only apply section chunking for PDFs with this many pages
+# Structured document chunking (auto-detected: text-rich PDFs with headings, e.g. annual reports).
+# Default 16 aligns with MISTRAL_OCR_MAX_PAGES: PDFs with >15 pages skip Mistral and rely on
+# native extraction + hierarchical section chunking + page-tree retrieval instead.
+STRUCTURED_DOC_MIN_PAGES = int(os.environ.get("STRUCTURED_DOC_MIN_PAGES", "16"))
+
+# Mistral full/per-page OCR applies only when PDF page count is <= this value (cost/latency).
+# Larger PDFs: pdfplumber/PyMuPDF/Tesseract only; structured chunking + trees handle navigation.
+# Override per file via sidecar .mistralocr or MISTRAL_OCR_FORCE_FILENAMES (see document_loader).
+MISTRAL_OCR_MAX_PAGES = int(os.environ.get("MISTRAL_OCR_MAX_PAGES", "15"))
 STRUCTURED_DOC_TEXT_RATIO = 0.80     # 80%+ pages must have extractable text to qualify
 STRUCTURED_MAX_CHUNK_CHARS = 50000   # large section-based chunks
 STRUCTURED_SKIP_RERANKER = True      # skip BGE CrossEncoder reranker for structured-doc results
@@ -81,13 +88,13 @@ CHROMA_COLLECTION_NAME = "claim_chunks"
 
 # BGE Reranker: second-stage reranking of hybrid results (query + passage -> score).
 # Uses sentence-transformers CrossEncoder; first load may download the model.
-RERANKER_MODEL = "BAAI/bge-reranker-base"
+image.png
 # How many candidates to pass to the reranker. Tuned down from 80 -> 30 because:
 #   (a) BM25+vector RRF upstream already filters weak matches,
 #   (b) BGE rerank quality on 25-30 candidates is statistically ~equal to 80,
 #   (c) CPU rerank time scales linearly with candidate count — 30 is ~2.5x faster.
 # Raise back to 60-80 only if you observe the right chunk consistently missing.
-RERANKER_CANDIDATES = 30
+RERANKER_CANDIDATES = 40
 # How many to return after reranking.
 RERANKER_TOP_K = 15
 # Max chars per passage sent to reranker (avoids token limit).
