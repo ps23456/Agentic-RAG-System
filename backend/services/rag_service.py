@@ -195,6 +195,81 @@ class RAGService:
         )
         return any(c in q_lower for c in cues)
 
+    @staticmethod
+    def _semantic_query_tokens(query: str) -> list[str]:
+        """Meaningful query words used for cross-file coherence reranking."""
+        words = re.findall(r"[a-z0-9]{3,}", (query or "").lower())
+        stop = {
+            "the", "and", "for", "with", "from", "what", "when", "where", "which",
+            "who", "whom", "why", "how", "are", "was", "were", "is", "tell", "show",
+            "give", "find", "about", "that", "this", "have", "has", "had", "does",
+            "did", "can", "could", "would", "should", "your", "our", "their", "there",
+            "into", "over", "under", "than", "then", "also", "please",
+        }
+        out: list[str] = []
+        for w in words:
+            if w in stop:
+                continue
+            if w not in out:
+                out.append(w)
+        return out
+
+    def _rerank_results_by_file_intent(self, results: list[dict], query: str) -> list[dict]:
+        """Post-fusion boost for files with coherent multi-hit semantic evidence.
+
+        This improves indirect queries where the right file is present but slightly
+        below noisy generic chunks.
+        """
+        if not results:
+            return results
+        q_lower = (query or "").strip().lower()
+        if not q_lower:
+            return results
+
+        tokens = self._semantic_query_tokens(query)
+        if not tokens:
+            return results
+
+        file_stats: dict[str, dict] = {}
+        for r in results:
+            fn = (r.get("file_name") or "").strip()
+            if not fn:
+                continue
+            score = float(r.get("score", 0.0) or 0.0)
+            snippet = (r.get("snippet", "") or "").lower()
+            title = (r.get("section_title", "") or "").lower()
+            blob = f"{fn.lower()} {title} {snippet}"
+            matched = [t for t in tokens if t in blob]
+            st = file_stats.setdefault(
+                fn,
+                {"hits": 0, "strong_hits": 0, "support": 0, "max_score": 0.0, "exact": 0},
+            )
+            st["support"] += 1
+            st["max_score"] = max(float(st["max_score"]), score)
+            st["hits"] += len(matched)
+            st["strong_hits"] += sum(1 for t in matched if len(t) >= 5)
+            if len(q_lower) >= 10 and q_lower in blob:
+                st["exact"] = 1
+
+        file_bonus: dict[str, float] = {}
+        for fn, st in file_stats.items():
+            hit_ratio = min(1.0, float(st["hits"]) / max(1.0, float(len(tokens))))
+            strong_ratio = min(1.0, float(st["strong_hits"]) / max(1.0, float(len(tokens))))
+            support_bonus = min(0.15, 0.04 * max(0, int(st["support"]) - 1))
+            exact_bonus = 0.18 if st["exact"] else 0.0
+            file_bonus[fn] = (0.35 * hit_ratio) + (0.22 * strong_ratio) + support_bonus + exact_bonus
+
+        boosted: list[dict] = []
+        for r in results:
+            fn = (r.get("file_name") or "").strip()
+            bonus = file_bonus.get(fn, 0.0)
+            nr = dict(r)
+            nr["score"] = round(float(r.get("score", 0.0) or 0.0) + bonus, 4)
+            boosted.append(nr)
+
+        boosted.sort(key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)
+        return boosted
+
     def get_patients(self) -> list[str]:
         if not self.search_index or not hasattr(self.search_index, "chunks"):
             return []
@@ -528,7 +603,10 @@ class RAGService:
         dropped_tenant: list[str] = []
         dropped_file_filter: list[str] = []
         dropped_allowed: list[str] = []
-        for raw in (fused or [])[:25]:
+        # Keep a wider candidate pool for indirect queries so re-ranking can
+        # recover the best file even when its best chunk is not in the first
+        # tiny slice.
+        for raw in (fused or [])[:60]:
             r = _normalize_fused_item(raw)
             if not r:
                 continue
@@ -614,6 +692,11 @@ class RAGService:
             if allowed_files is not None:
                 results = [r for r in results if (r.get("file_name") or "") in allowed_files]
             logger.info("[chat-timing] merge_tree_and_rag: %.2fs", time.time() - t0)
+
+        # Final cross-type ranking pass (text/image/tree) by per-file semantic
+        # coherence. This is the key guardrail for indirect queries over many files.
+        if not effective_file_filter:
+            results = self._rerank_results_by_file_intent(results, query)
 
         q_lower = (query or "").strip().lower()
         exact_phrase_sources: list[dict] = []
