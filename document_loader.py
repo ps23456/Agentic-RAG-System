@@ -701,7 +701,7 @@ def _ocr_image_pages(path: str) -> List[tuple[int, str]]:
         return []
 
 
-def extract_text_from_pdf(path: str) -> List[tuple[int, str]]:
+def extract_text_from_pdf(path: str, mistral_first: bool = True) -> List[tuple[int, str]]:
     """
     Extract text from PDF.
     Priority (when key is present): Mistral OCR first, then local extraction fallback.
@@ -722,7 +722,7 @@ def extract_text_from_pdf(path: str) -> List[tuple[int, str]]:
     # 0.5 Mistral-first mode: on every upload/index pass, attempt full-document
     # cloud OCR when key is available. This captures form checkboxes/handwriting
     # that native PDF text extraction misses.
-    if _MISTRAL_OCR_KEY and not _is_mistral_disabled():
+    if mistral_first and _MISTRAL_OCR_KEY and not _is_mistral_disabled():
         mistral_pages = _mistral_ocr_pdf(path)
         if mistral_pages:
             return mistral_pages

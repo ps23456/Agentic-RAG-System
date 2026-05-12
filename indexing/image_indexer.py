@@ -19,6 +19,7 @@ from config import (
     STRUCTURED_DOC_MIN_PAGES,
 )
 from document_loader import (
+    extract_chunk_metadata,
     get_document_metadata_for_path,
     extract_text_from_image,
     extract_text_from_pdf,
@@ -330,8 +331,17 @@ def _collect_image_items(
                         continue
                     
                     logger.info("Indexing PDF as images: %s (%d pages)", base, page_count)
-                    doc_meta = get_document_metadata_for_path(path)
-                    pdf_text_pages = extract_text_from_pdf(path)
+                    # Important: in image-index flow, avoid re-triggering full-document
+                    # Mistral-first OCR if text indexing already did it. Use local/page
+                    # extraction path here and derive metadata from that text.
+                    pdf_text_pages = extract_text_from_pdf(path, mistral_first=False)
+                    doc_meta = (
+                        extract_chunk_metadata(
+                            "\n\n".join(t for _, t in (pdf_text_pages or [])[:10] if t)
+                        )
+                        if pdf_text_pages
+                        else {}
+                    )
                     pdf_text_map = {p: t for p, t in pdf_text_pages}
                     
                     for page_num in range(page_count):
