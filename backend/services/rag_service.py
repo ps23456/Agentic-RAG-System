@@ -428,7 +428,11 @@ class RAGService:
         Does NOT call the summary LLM. Shared by chat() (non-streaming, legacy)
         and stream_chat() (SSE). Returns None when no index is loaded.
         """
-        from retrieval.agentic_rag import run_agentic_rag, get_robust_catalog
+        from retrieval.agentic_rag import (
+            augment_catalog_with_image_patients,
+            get_robust_catalog,
+            run_agentic_rag,
+        )
         from retrieval.text_retriever import TextRetriever
         from retrieval.image_retriever import ImageRetriever
 
