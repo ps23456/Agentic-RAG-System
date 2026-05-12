@@ -28,8 +28,9 @@ cryptography>=42.0.0
 # (opencv-python 4.13+ requires numpy>=2 and conflicts with torch/docling.)
 opencv-python>=4.8,<4.10
 docling>=2.0.0
-# Mistral OCR (SDK; pin floor for reproducible Docker builds)
-mistralai>=1.0.0,<4
+# Mistral OCR: PyPI project "mistralai" is currently quarantined (simple index has no files;
+# pip reports "from versions: none"). Install the official client from GitHub (needs `git` for pip).
+mistralai @ git+https://github.com/mistralai/client-python.git@v2.4.5
 # Web search (DuckDuckGo)
 duckduckgo-search>=4.0.0
 # FastAPI backend

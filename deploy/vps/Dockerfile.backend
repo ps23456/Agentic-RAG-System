@@ -11,6 +11,7 @@ WORKDIR /app
 # Runtime libs needed by OCR/PDF/image stack.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    git \
     tesseract-ocr \
     poppler-utils \
     libgl1 \
@@ -19,21 +20,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
-# Pip can report "No matching distribution ... (from versions: none)" for mistralai when it
-# resolves the *entire* graph together with docling + heavy ML wheels. Install everything
-# except mistralai first, then mistralai alone (same constraint as requirements.txt).
-# Pin pip < 26: pip 26.1+ has also been observed with odd resolver behavior on some hosts.
-RUN grep -v '^mistralai' /app/requirements.txt > /app/requirements.nomistral.txt && \
-    pip install --no-cache-dir "pip>=25.0,<26" setuptools wheel && \
+# Pin pip < 26 for stable resolution. mistralai is installed from GitHub (see requirements.txt)
+# because the PyPI "mistralai" project is quarantined and exposes no wheels on the simple API.
+RUN pip install --no-cache-dir "pip>=25.0,<26" setuptools wheel && \
     pip install --no-cache-dir \
       --index-url https://pypi.org/simple \
       --trusted-host pypi.org --trusted-host files.pythonhosted.org \
-      -r /app/requirements.nomistral.txt && \
-    pip install --no-cache-dir \
-      --index-url https://pypi.org/simple \
-      --trusted-host pypi.org --trusted-host files.pythonhosted.org \
-      "mistralai>=1.0.0,<4" && \
-    rm -f /app/requirements.nomistral.txt
+      -r /app/requirements.txt
 
 COPY . /app
 
