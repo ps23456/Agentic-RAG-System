@@ -14,7 +14,6 @@ import json
 from config import (
     DATA_FOLDER,
     MISTRAL_OCR_FORCE_FILENAMES,
-    MISTRAL_OCR_MAX_PAGES,
     STRUCTURED_DOC_MIN_PAGES,
 )
 
@@ -754,10 +753,6 @@ def extract_text_from_pdf(path: str, mistral_first: bool = True) -> List[tuple[i
 
     Results are cached in-process per (resolved path, mtime) so a single upload job does not
     re-run Mistral for chunking, page-tree build, and image indexing paths.
-
-    PDFs with more than ``MISTRAL_OCR_MAX_PAGES`` (default 15) skip all Mistral OCR unless the
-    file is forced (sidecar ``.mistralocr`` or ``MISTRAL_OCR_FORCE_FILENAMES``). Those documents
-    use native extraction + Tesseract and downstream structured chunking / page trees.
     """
     # Ensure key is picked up even in non-Streamlit/CLI contexts.
     _ensure_mistral_key_from_env()
@@ -776,25 +771,10 @@ def extract_text_from_pdf(path: str, mistral_first: bool = True) -> List[tuple[i
         _pdf_extract_cache_set(path, md_pages, "md_companion")
         return md_pages
 
-    page_total = _pdf_page_count(path)
-    mistral_allowed_by_size = page_total <= MISTRAL_OCR_MAX_PAGES or _should_force_mistral_ocr(path)
-    if page_total > MISTRAL_OCR_MAX_PAGES and not _should_force_mistral_ocr(path):
-        logger.info(
-            "PDF %s has %d pages (> %d): skipping Mistral OCR; local extract + structured/tree indexing.",
-            os.path.basename(path),
-            page_total,
-            MISTRAL_OCR_MAX_PAGES,
-        )
-
     # 0.5 Mistral-first mode: on every upload/index pass, attempt full-document
     # cloud OCR when key is available. This captures form checkboxes/handwriting
     # that native PDF text extraction misses.
-    if (
-        mistral_allowed_by_size
-        and mistral_first
-        and _MISTRAL_OCR_KEY
-        and not _is_mistral_disabled()
-    ):
+    if mistral_first and _MISTRAL_OCR_KEY and not _is_mistral_disabled():
         mistral_pages = _mistral_ocr_pdf(path)
         if mistral_pages:
             _pdf_extract_cache_set(path, mistral_pages, "mistral_full")
@@ -818,12 +798,7 @@ def extract_text_from_pdf(path: str, mistral_first: bool = True) -> List[tuple[i
     zero_text_pages = [p_num for p_num, text in pages if not text.strip()]
     ratio_zero_text = len(zero_text_pages) / len(pages)
     
-    if (
-        mistral_allowed_by_size
-        and ratio_zero_text > 0.9
-        and _MISTRAL_OCR_KEY
-        and not _is_mistral_disabled()
-    ):
+    if ratio_zero_text > 0.9 and _MISTRAL_OCR_KEY and not _is_mistral_disabled():
         # Document is almost entirely scanned/image based, use Mistral for global extraction
         mistral_pages = _mistral_ocr_pdf(path)
         if mistral_pages:
@@ -836,12 +811,7 @@ def extract_text_from_pdf(path: str, mistral_first: bool = True) -> List[tuple[i
         if _needs_ocr(text):
             # Try Mistral for this specific page if doc is small, else fallback to local Tesseract
             # Cloud OCR on every page of a large doc is too slow/expensive
-            if (
-                mistral_allowed_by_size
-                and _MISTRAL_OCR_KEY
-                and not _is_mistral_disabled()
-                and len(pages) < 10
-            ):
+            if _MISTRAL_OCR_KEY and not _is_mistral_disabled() and len(pages) < 10:
                 ocr_text = _mistral_ocr_pdf_page_render(path, page_num)
                 if not ocr_text.strip():
                     ocr_text = _ocr_pdf_page(path, page_num)
@@ -854,7 +824,7 @@ def extract_text_from_pdf(path: str, mistral_first: bool = True) -> List[tuple[i
             # but the real values live in visual checkboxes/handwriting. Run Mistral
             # OCR on these pages too, then append OCR output so retrieval can match
             # concrete values (e.g. checked "4 hours").
-            if mistral_allowed_by_size and _MISTRAL_OCR_KEY and not _is_mistral_disabled():
+            if _MISTRAL_OCR_KEY and not _is_mistral_disabled():
                 if _should_force_mistral_ocr(path) or _looks_like_form_template_text(text):
                     ocr_text = _mistral_ocr_pdf_page_render(path, page_num)
                     if ocr_text.strip():
