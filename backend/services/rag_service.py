@@ -282,6 +282,11 @@ class RAGService:
     def _is_image_file_name(file_name: str) -> bool:
         return (file_name or "").lower().endswith(_IMAGE_SUFFIXES)
 
+    @staticmethod
+    def _source_key(file_name: str, page) -> tuple[str, str]:
+        """Stable (file, page) key — avoids int vs str mismatches when joining sources to chunks."""
+        return ((file_name or "").strip(), "" if page is None else str(page))
+
     def _result_evidence_blob(self, result: dict) -> str:
         """Text used to decide if a chunk (PDF, MD, or image) supports the query."""
         parts = [
@@ -347,6 +352,33 @@ class RAGService:
                 "auto_caption": c.get("auto_caption", "") or "",
             }
         return None
+
+    def _result_row_to_fused_item(self, row: dict) -> dict:
+        """Wrap a chat ``results`` row as a fused item for summary prompting."""
+        if row.get("type") == "image":
+            return {
+                "type": "image",
+                "content": {
+                    "file_name": row.get("file_name", ""),
+                    "page": row.get("page"),
+                    "ocr_text": row.get("snippet", "") or "",
+                    "auto_caption": row.get("auto_caption", "") or "",
+                    "path": row.get("path", "") or "",
+                    "is_pdf_page": row.get("is_pdf_page", False),
+                },
+                "final_score": float(row.get("score", 0) or 0),
+            }
+        from types import SimpleNamespace
+        return {
+            "type": "text",
+            "content": SimpleNamespace(
+                file_name=row.get("file_name", ""),
+                page_number=row.get("page"),
+                text=row.get("snippet", "") or "",
+                _section_title=row.get("section_title", "") or "",
+            ),
+            "final_score": float(row.get("score", 0) or 0),
+        }
 
     def _file_names_for_patient(
         self,
@@ -553,7 +585,7 @@ class RAGService:
                 by_file[fn] = r
 
         per_file_sources: list[dict] = []
-        seen: set[tuple] = set()
+        seen: set[tuple[str, str]] = set()
         for r in sorted(
             by_file.values(),
             key=lambda x: float(x.get("score", 0.0) or 0.0),
@@ -561,7 +593,7 @@ class RAGService:
         ):
             fn = r.get("file_name", "")
             pg = r.get("page")
-            key = (fn, pg)
+            key = self._source_key(fn, pg)
             if not fn or key in seen:
                 continue
             seen.add(key)
@@ -572,7 +604,7 @@ class RAGService:
         for r in results:
             fn = r.get("file_name", "")
             pg = r.get("page")
-            key = (fn, pg)
+            key = self._source_key(fn, pg)
             if not fn or key in seen:
                 continue
             seen.add(key)
@@ -595,7 +627,7 @@ class RAGService:
         deduped: list[dict] = []
         seen_keys: set[tuple] = set()
         for src in score_sources:
-            key = (src.get("file_name"), src.get("page"))
+            key = self._source_key(src.get("file_name", ""), src.get("page"))
             if key in seen_keys:
                 continue
             seen_keys.add(key)
@@ -1092,54 +1124,63 @@ class RAGService:
             if len(score_sources) > 8:
                 score_sources = score_sources[:8]
 
-        fused_map: dict[tuple, dict] = {}
+        fused_map: dict[tuple[str, str], dict] = {}
         for raw in (fused or []):
             r = _normalize_fused_item(raw)
             if not r:
                 continue
             c = r.get("content")
             if r.get("type") == "text" and hasattr(c, "file_name"):
-                key = (getattr(c, "file_name", ""), getattr(c, "page_number", None))
+                key = self._source_key(
+                    getattr(c, "file_name", ""),
+                    getattr(c, "page_number", None),
+                )
                 if key not in fused_map or (r.get("final_score", 0) > fused_map[key].get("final_score", 0)):
                     fused_map[key] = r
             elif r.get("type") == "image" and isinstance(c, dict):
-                key = (c.get("file_name", ""), c.get("page"))
+                key = self._source_key(c.get("file_name", ""), c.get("page"))
                 if key not in fused_map:
                     fused_map[key] = r
 
         ordered_fused: list[dict] = []
         for src in score_sources:
-            key = (src["file_name"], src.get("page"))
+            key = self._source_key(src.get("file_name", ""), src.get("page"))
             if key in fused_map:
                 ordered_fused.append(fused_map[key])
-            else:
-                res = next((x for x in results if (x.get("file_name"), x.get("page")) == key), None)
-                if res:
-                    if res.get("type") == "image":
-                        ordered_fused.append({
-                            "type": "image",
-                            "content": {
-                                "file_name": res.get("file_name", ""),
-                                "page": res.get("page"),
-                                "ocr_text": res.get("snippet", "") or "",
-                                "auto_caption": res.get("auto_caption", "") or "",
-                                "path": res.get("path", "") or "",
-                                "is_pdf_page": res.get("is_pdf_page", False),
-                            },
-                            "final_score": res.get("score", 0),
-                        })
-                    else:
-                        from types import SimpleNamespace
-                        ordered_fused.append({
-                            "type": "text",
-                            "content": SimpleNamespace(
-                                file_name=res.get("file_name", ""),
-                                page_number=res.get("page"),
-                                text=res.get("snippet", ""),
-                                _section_title=res.get("section_title", ""),
-                            ),
-                            "final_score": res.get("score", 0),
-                        })
+                continue
+            res = next(
+                (
+                    x
+                    for x in results
+                    if self._source_key(x.get("file_name", ""), x.get("page")) == key
+                ),
+                None,
+            )
+            if res:
+                ordered_fused.append(self._result_row_to_fused_item(res))
+
+        # Regression guard: retrieval can return ``results`` while citation join
+        # fails (page type mismatch, missing fused_map row). Never leave the LLM
+        # with an empty prompt — that caused chars=0 / Slack "(empty reply)".
+        if not ordered_fused and results:
+            logger.warning(
+                "[chat] ordered_fused empty but results=%d score_sources=%d — using results rows",
+                len(results),
+                len(score_sources),
+            )
+            for r in results[:8]:
+                ordered_fused.append(self._result_row_to_fused_item(r))
+
+        if not score_sources and results:
+            score_sources = [
+                {
+                    "file_name": r.get("file_name", ""),
+                    "page": r.get("page"),
+                    "title": r.get("file_name", ""),
+                }
+                for r in results[:8]
+                if r.get("file_name")
+            ]
 
         web_context = ""
         if web_search:
@@ -1355,6 +1396,21 @@ class RAGService:
         if not summary and ctx["direct_answer"]:
             summary = ctx["direct_answer"]
             yield ("token", summary)
+
+        if not summary and ctx.get("results") and ctx.get("llm_key"):
+            try:
+                refill = [
+                    self._result_row_to_fused_item(r)
+                    for r in ctx["results"][:8]
+                ]
+                prompt2, _ = build_summary_prompt_and_sources(query, refill)
+                if prompt2:
+                    from retrieval.agentic_rag import _call_llm
+                    summary = _call_llm(prompt2, ctx["llm_key"], ctx["provider"]) or ""
+                    if summary:
+                        yield ("token", summary)
+            except Exception as e:
+                logger.warning("results-only summary fallback failed: %s", e)
 
         final_sources = summary_sources if summary_sources else ctx["score_sources"]
 
