@@ -64,6 +64,65 @@ async function sayLong(
   }
 }
 
+/** Lowercase, single spaces, trim trailing sentence punctuation (for small-talk matching only). */
+function normalizeForSmalltalk(s: string): string {
+  let t = s.toLowerCase().trim().replace(/\s+/g, " ");
+  t = t.replace(/[!?.…]+$/u, "").trim();
+  return t;
+}
+
+/**
+ * Canned replies for greetings / thanks / help — avoids a full RAG round-trip.
+ * Only matches when the whole message looks like small talk (not "hi, what is…").
+ */
+function smalltalkReply(query: string): string | null {
+  const q = normalizeForSmalltalk(query);
+  if (!q || q.length > 160) return null;
+
+  const docHint =
+    "Ask me anything about your uploaded documents (claims, policies, forms), or run `/raglist` to see what’s indexed.";
+
+  const rows: Array<{ re: RegExp; reply: string }> = [
+    {
+      re: /^(hi|hello|hey|yo|hola|howdy|namaste|sup|wassup|what'?s up|whats up)( there)?$/,
+      reply: `Hi there! ${docHint}`,
+    },
+    {
+      re: /^(good (morning|afternoon|evening|night|day))$/,
+      reply: `Hello! ${docHint}`,
+    },
+    {
+      re: /^(how are you|how r you|how're you|hows it going|how'?s it going|how is it going|how have you been|you ok|u ok|everything ok)\??$/,
+      reply: `I'm doing well — thanks for asking! I'm here to help search your documents. ${docHint}`,
+    },
+    {
+      re: /^(thanks|thank you|thx|ty|cheers|much appreciated|appreciate it|thank u)$/,
+      reply: "You're welcome! Mention me anytime you have another question.",
+    },
+    {
+      re: /^(bye|goodbye|cya|see ya|see you|later|take care|ttyl)$/,
+      reply: "Goodbye! Ping me whenever you need something from your docs.",
+    },
+    {
+      re: /^(who are you|what are you|what do you do|what can you do)\??$/,
+      reply: `I'm your workspace RAG assistant — I search the documents indexed for this Slack workspace and answer with citations. ${docHint}`,
+    },
+    {
+      re: /^(help|\?|commands|how does this work)\??$/,
+      reply: `• Mention me with a question, e.g. \`@RAGBOT summarize the claim\`\n• \`/raglist\` — list indexed files\n• Upload a supported file in a channel I can see — I’ll index it automatically.\n\n${docHint}`,
+    },
+    {
+      re: /^(ok|okay|k|kk|nice|cool|great|awesome|perfect|got it|sounds good)$/,
+      reply: `Glad that helps! ${docHint}`,
+    },
+  ];
+
+  for (const { re, reply } of rows) {
+    if (re.test(q)) return reply;
+  }
+  return null;
+}
+
 const botToken = normalizeSecret(process.env.SLACK_BOT_TOKEN);
 const appToken = normalizeSecret(process.env.SLACK_APP_TOKEN);
 const signingSecret = normalizeSecret(process.env.SLACK_SIGNING_SECRET);
@@ -131,10 +190,18 @@ app.event("app_mention", async ({ event, say }) => {
   }
   const raw = "text" in event && typeof event.text === "string" ? event.text : "";
   const query = raw.replace(/<@[^>]+>/g, "").trim();
+  const threadTs = "thread_ts" in event ? event.thread_ts : undefined;
+
+  const small = smalltalkReply(query);
+  if (small) {
+    await say({ text: small, thread_ts: threadTs });
+    return;
+  }
+
   if (!query) {
     await say({
       text: "Mention me with a question, e.g. `@bot what is in the lease?`",
-      thread_ts: "thread_ts" in event ? event.thread_ts : undefined,
+      thread_ts: threadTs,
     });
     return;
   }
@@ -147,11 +214,11 @@ app.event("app_mention", async ({ event, say }) => {
         break;
       }
     }
-    await sayLong(say, out || "(empty reply)", "thread_ts" in event ? event.thread_ts : undefined);
+    await sayLong(say, out || "(empty reply)", threadTs);
   } catch (e) {
     await say({
       text: `RAG error: ${e instanceof Error ? e.message : String(e)}`,
-      thread_ts: "thread_ts" in event ? event.thread_ts : undefined,
+      thread_ts: threadTs,
     });
   }
 });

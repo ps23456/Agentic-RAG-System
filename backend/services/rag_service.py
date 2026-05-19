@@ -10,9 +10,11 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from config import DATA_FOLDER
+from config import DATA_FOLDER, IMAGE_EXTENSIONS
 
 logger = logging.getLogger(__name__)
+
+_IMAGE_SUFFIXES = tuple(ext.lower() for ext in IMAGE_EXTENSIONS)
 
 
 class RAGService:
@@ -275,6 +277,166 @@ class RAGService:
 
         boosted.sort(key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True)
         return boosted
+
+    @staticmethod
+    def _is_image_file_name(file_name: str) -> bool:
+        return (file_name or "").lower().endswith(_IMAGE_SUFFIXES)
+
+    def _result_evidence_blob(self, result: dict) -> str:
+        """Text used to decide if a chunk (PDF, MD, or image) supports the query."""
+        parts = [
+            result.get("snippet") or "",
+            result.get("auto_caption") or "",
+            result.get("patient_name") or "",
+            result.get("file_name") or "",
+            result.get("section_title") or "",
+        ]
+        return " ".join(str(p) for p in parts if p).lower()
+
+    def _result_has_query_evidence(self, result: dict, query: str) -> bool:
+        """True when a retrieved chunk plausibly supports the question (broad multi-file mode)."""
+        blob = self._result_evidence_blob(result)
+        score = float(result.get("score", 0.0) or 0.0)
+        if not blob.strip():
+            return score > 0.25 if result.get("type") == "image" else False
+
+        tokens = self._semantic_query_tokens(query)
+        if not tokens:
+            return score > 0.0
+
+        hits = sum(1 for t in tokens if t in blob)
+        if hits >= 1:
+            return True
+
+        q_lower = (query or "").strip().lower()
+        if len(q_lower) >= 10 and q_lower in blob:
+            return True
+
+        # CLIP image hits may have weak OCR but strong fused score — still show the file.
+        if result.get("type") == "image" or self._is_image_file_name(result.get("file_name") or ""):
+            return score >= 0.28
+
+        return False
+
+    def _ensure_multi_file_results(self, results: list[dict], query: str, max_files: int = 12) -> list[dict]:
+        """Broad chat: surface the best chunk from each relevant file, not only the top file.
+
+        Applies to PDFs, markdown, and image uploads (PNG/JPG/etc.): one strong hit per
+        ``file_name``, then the remaining ranked chunks.
+        """
+        if not results:
+            return results
+
+        by_file: dict[str, dict] = {}
+        for r in results:
+            fn = (r.get("file_name") or "").strip()
+            if not fn:
+                continue
+            if not self._result_has_query_evidence(r, query):
+                continue
+            score = float(r.get("score", 0.0) or 0.0)
+            prev = by_file.get(fn)
+            if prev is None or score > float(prev.get("score", 0.0) or 0.0):
+                by_file[fn] = r
+
+        if len(by_file) <= 1:
+            return results
+
+        reps = sorted(
+            by_file.values(),
+            key=lambda x: float(x.get("score", 0.0) or 0.0),
+            reverse=True,
+        )[:max_files]
+
+        out: list[dict] = []
+        seen: set[tuple] = set()
+        for r in reps:
+            key = (r.get("file_name"), r.get("page"))
+            if key in seen:
+                continue
+            out.append(r)
+            seen.add(key)
+        for r in results:
+            key = (r.get("file_name"), r.get("page"))
+            if key in seen:
+                continue
+            out.append(r)
+            seen.add(key)
+        return out
+
+    def _build_score_sources_multi_file(
+        self,
+        results: list[dict],
+        query: str,
+        *,
+        max_sources: int = 12,
+    ) -> list[dict]:
+        """Citation list for broad queries: at least one source per relevant file when possible.
+
+        Includes standalone images (``.png`` / ``.jpg``) and PDF page image-index rows.
+        """
+        q_lower = (query or "").strip().lower()
+        by_file: dict[str, dict] = {}
+        for r in results:
+            fn = (r.get("file_name") or "").strip()
+            if not fn or not self._result_has_query_evidence(r, query):
+                continue
+            score = float(r.get("score", 0.0) or 0.0)
+            prev = by_file.get(fn)
+            if prev is None or score > float(prev.get("score", 0.0) or 0.0):
+                by_file[fn] = r
+
+        per_file_sources: list[dict] = []
+        seen: set[tuple] = set()
+        for r in sorted(
+            by_file.values(),
+            key=lambda x: float(x.get("score", 0.0) or 0.0),
+            reverse=True,
+        ):
+            fn = r.get("file_name", "")
+            pg = r.get("page")
+            key = (fn, pg)
+            if not fn or key in seen:
+                continue
+            seen.add(key)
+            per_file_sources.append({"file_name": fn, "page": pg, "title": fn})
+
+        exact_phrase_sources: list[dict] = []
+        other_sources: list[dict] = []
+        for r in results:
+            fn = r.get("file_name", "")
+            pg = r.get("page")
+            key = (fn, pg)
+            if not fn or key in seen:
+                continue
+            seen.add(key)
+            src = {"file_name": fn, "page": pg, "title": fn}
+            if r.get("type") == "web" and r.get("url"):
+                src["url"] = r["url"]
+            blob = self._result_evidence_blob(r)
+            is_visual = (
+                r.get("type") == "image"
+                or self._is_image_file_name(fn)
+                or fn.lower().endswith(".pdf")
+            )
+            if len(q_lower) >= 10 and q_lower in blob and is_visual:
+                exact_phrase_sources.append(src)
+            else:
+                other_sources.append(src)
+
+        score_sources = per_file_sources + exact_phrase_sources + other_sources
+        # Preserve order but drop duplicates after merge.
+        deduped: list[dict] = []
+        seen_keys: set[tuple] = set()
+        for src in score_sources:
+            key = (src.get("file_name"), src.get("page"))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(src)
+        if len(deduped) > max_sources:
+            deduped = deduped[:max_sources]
+        return deduped
 
     def get_patients(self) -> list[str]:
         if not self.search_index or not hasattr(self.search_index, "chunks"):
@@ -714,29 +876,31 @@ class RAGService:
         # coherence. This is the key guardrail for indirect queries over many files.
         if not effective_file_filter:
             results = self._rerank_results_by_file_intent(results, query)
-
-        q_lower = (query or "").strip().lower()
-        exact_phrase_sources: list[dict] = []
-        other_sources: list[dict] = []
-        seen_src: set[tuple] = set()
-        for r in results:
-            fn = r.get("file_name", "")
-            pg = r.get("page")
-            key = (fn, pg)
-            if not fn or key in seen_src:
-                continue
-            src = {"file_name": fn, "page": pg, "title": fn}
-            if r.get("type") == "web" and r.get("url"):
-                src["url"] = r["url"]
-            seen_src.add(key)
-            snippet = (r.get("snippet", "") or "").lower()
-            if len(q_lower) >= 10 and q_lower in snippet and fn.lower().endswith(".pdf"):
-                exact_phrase_sources.append(src)
-            else:
-                other_sources.append(src)
-        score_sources = exact_phrase_sources + other_sources
-        if len(score_sources) > 8:
-            score_sources = score_sources[:8]
+            results = self._ensure_multi_file_results(results, query)
+            score_sources = self._build_score_sources_multi_file(results, query, max_sources=12)
+        else:
+            q_lower = (query or "").strip().lower()
+            exact_phrase_sources: list[dict] = []
+            other_sources: list[dict] = []
+            seen_src: set[tuple] = set()
+            for r in results:
+                fn = r.get("file_name", "")
+                pg = r.get("page")
+                key = (fn, pg)
+                if not fn or key in seen_src:
+                    continue
+                src = {"file_name": fn, "page": pg, "title": fn}
+                if r.get("type") == "web" and r.get("url"):
+                    src["url"] = r["url"]
+                seen_src.add(key)
+                snippet = (r.get("snippet", "") or "").lower()
+                if len(q_lower) >= 10 and q_lower in snippet and fn.lower().endswith(".pdf"):
+                    exact_phrase_sources.append(src)
+                else:
+                    other_sources.append(src)
+            score_sources = exact_phrase_sources + other_sources
+            if len(score_sources) > 8:
+                score_sources = score_sources[:8]
 
         fused_map: dict[tuple, dict] = {}
         for raw in (fused or []):
@@ -761,17 +925,31 @@ class RAGService:
             else:
                 res = next((x for x in results if (x.get("file_name"), x.get("page")) == key), None)
                 if res:
-                    from types import SimpleNamespace
-                    ordered_fused.append({
-                        "type": "text",
-                        "content": SimpleNamespace(
-                            file_name=res.get("file_name", ""),
-                            page_number=res.get("page"),
-                            text=res.get("snippet", ""),
-                            _section_title=res.get("section_title", ""),
-                        ),
-                        "final_score": res.get("score", 0),
-                    })
+                    if res.get("type") == "image":
+                        ordered_fused.append({
+                            "type": "image",
+                            "content": {
+                                "file_name": res.get("file_name", ""),
+                                "page": res.get("page"),
+                                "ocr_text": res.get("snippet", "") or "",
+                                "auto_caption": res.get("auto_caption", "") or "",
+                                "path": res.get("path", "") or "",
+                                "is_pdf_page": res.get("is_pdf_page", False),
+                            },
+                            "final_score": res.get("score", 0),
+                        })
+                    else:
+                        from types import SimpleNamespace
+                        ordered_fused.append({
+                            "type": "text",
+                            "content": SimpleNamespace(
+                                file_name=res.get("file_name", ""),
+                                page_number=res.get("page"),
+                                text=res.get("snippet", ""),
+                                _section_title=res.get("section_title", ""),
+                            ),
+                            "final_score": res.get("score", 0),
+                        })
 
         web_context = ""
         if web_search:

@@ -171,3 +171,75 @@ def diversify_fused_results(
                     entity_counts[key] = entity_counts.get(key, 0) + 1
 
     return out[:top_k]
+
+
+def _file_key_from_fused_item(r: dict) -> str:
+    c = r.get("content")
+    if c is None:
+        return ""
+    if hasattr(c, "file_name"):
+        return (getattr(c, "file_name", "") or "").strip()
+    if isinstance(c, dict):
+        return (c.get("file_name", "") or "").strip()
+    return ""
+
+
+def diversify_fused_results_by_file(
+    fused: List[dict],
+    top_k: int = 15,
+    max_per_file: int = 2,
+) -> List[dict]:
+    """Ensure fused results are not dominated by a single basename (e.g. .md over .pdf).
+
+    Groups by ``file_name`` (PDF, markdown, PNG/JPG image rows, etc.) and round-robins
+    so each file contributes up to ``max_per_file`` chunks before one file fills top-k.
+    """
+    if not fused:
+        return fused[:top_k]
+
+    by_file: dict[str, List[dict]] = {}
+    for r in fused:
+        key = _file_key_from_fused_item(r)
+        if not key:
+            key = "_no_file_"
+        by_file.setdefault(key, []).append(r)
+
+    for key in by_file:
+        by_file[key].sort(key=lambda x: x.get("final_score", 0), reverse=True)
+
+    out: List[dict] = []
+    file_counts: dict[str, int] = {k: 0 for k in by_file}
+    files_with_items = list(by_file.keys())
+
+    while len(out) < top_k:
+        added = False
+        for key in files_with_items:
+            if file_counts[key] >= max_per_file:
+                continue
+            items = by_file[key]
+            taken = file_counts[key]
+            if taken < len(items):
+                r = items[taken]
+                if r not in out:
+                    out.append(r)
+                    file_counts[key] += 1
+                    added = True
+                    if len(out) >= top_k:
+                        break
+        if not added:
+            break
+
+    if len(out) < top_k:
+        seen = {id(r.get("content")) for r in out}
+        for r in sorted(fused, key=lambda x: x.get("final_score", 0), reverse=True):
+            if len(out) >= top_k:
+                break
+            if id(r.get("content")) in seen:
+                continue
+            key = _file_key_from_fused_item(r) or "_no_file_"
+            if file_counts.get(key, 0) < max_per_file:
+                out.append(r)
+                seen.add(id(r.get("content")))
+                file_counts[key] = file_counts.get(key, 0) + 1
+
+    return out[:top_k]

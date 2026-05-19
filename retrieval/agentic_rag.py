@@ -1460,6 +1460,14 @@ def run_agentic_rag(
                 fused, entity_key="patient_name",
                 top_k=MULTIMODAL_HYBRID_TOP_K, max_per_entity=METADATA_DIVERSITY_MAX_PER_ENTITY,
             )
+        elif has_patient_scope and not has_file_scope and fused:
+            # Same patient often has multiple files (.md export + APS PDF). Per-patient
+            # diversity caps total chunks, not per file — promote file coverage here.
+            from .result_diversifier import diversify_fused_results_by_file
+
+            fused = diversify_fused_results_by_file(
+                fused, top_k=MULTIMODAL_HYBRID_TOP_K, max_per_file=2,
+            )
 
     # Step 4: Guarantee minimum results — retry broader if too few
     if len(fused) < MIN_RESULTS and index and index.chunks:
