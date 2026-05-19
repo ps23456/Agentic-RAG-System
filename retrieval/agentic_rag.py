@@ -1460,13 +1460,16 @@ def run_agentic_rag(
                 fused, entity_key="patient_name",
                 top_k=MULTIMODAL_HYBRID_TOP_K, max_per_entity=METADATA_DIVERSITY_MAX_PER_ENTITY,
             )
-        elif has_patient_scope and not has_file_scope and fused:
-            # Same patient often has multiple files (.md export + APS PDF). Per-patient
-            # diversity caps total chunks, not per file — promote file coverage here.
+        elif fused and not has_file_scope:
+            # Broad / indirect queries: do not let one basename dominate fused top-k.
+            # - image_heavy: diagram.jpg + real estate app.jpg both surface for
+            #   "boxes and arrows" style questions
+            # - patient scope: teresa brown.md + APS_TBrown.pdf for the same patient
             from .result_diversifier import diversify_fused_results_by_file
 
+            per_file_cap = 3 if query_type == "image_heavy" else 2
             fused = diversify_fused_results_by_file(
-                fused, top_k=MULTIMODAL_HYBRID_TOP_K, max_per_file=2,
+                fused, top_k=MULTIMODAL_HYBRID_TOP_K, max_per_file=per_file_cap,
             )
 
     # Step 4: Guarantee minimum results — retry broader if too few

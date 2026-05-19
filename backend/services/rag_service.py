@@ -318,29 +318,195 @@ class RAGService:
 
         return False
 
-    def _ensure_multi_file_results(self, results: list[dict], query: str, max_files: int = 12) -> list[dict]:
+    def _fused_item_to_result(self, raw: dict, final_score: float | None = None) -> dict | None:
+        """Convert one fused retrieval item to the chat ``results`` row shape."""
+        c = raw.get("content")
+        if raw.get("type") == "text" and hasattr(c, "file_name"):
+            score = float(final_score if final_score is not None else raw.get("final_score", 0) or 0)
+            return {
+                "type": "text",
+                "file_name": getattr(c, "file_name", ""),
+                "page": getattr(c, "page_number", None),
+                "score": score,
+                "snippet": (getattr(c, "text", "") or "")[:2000],
+                "patient_name": getattr(c, "patient_name", "") or "",
+                "section_title": getattr(c, "_section_title", "") or "",
+            }
+        if raw.get("type") == "image" and isinstance(c, dict):
+            snippet_src = c.get("ocr_text", "") or c.get("auto_caption", "") or ""
+            score = float(final_score if final_score is not None else raw.get("final_score", 0) or 0)
+            return {
+                "type": "image",
+                "file_name": c.get("file_name", ""),
+                "page": c.get("page"),
+                "score": score,
+                "snippet": snippet_src[:500],
+                "patient_name": c.get("patient_name", "") or "",
+                "is_pdf_page": c.get("is_pdf_page", False),
+                "path": c.get("path", "") or "",
+                "auto_caption": c.get("auto_caption", "") or "",
+            }
+        return None
+
+    def _file_names_for_patient(
+        self,
+        patient: str,
+        allowed_files: set[str] | None = None,
+    ) -> set[str]:
+        """Basenames indexed for a patient (text chunks)."""
+        if not patient or not self.search_index or not getattr(self.search_index, "chunks", None):
+            return set()
+        target = patient.strip().lower()
+        out: set[str] = set()
+        for c in self.search_index.chunks:
+            fn = (getattr(c, "file_name", "") or "").strip()
+            if not fn:
+                continue
+            pn = (getattr(c, "patient_name", "") or "").strip().lower()
+            if not pn or target not in pn and pn not in target:
+                continue
+            if allowed_files is not None and fn not in allowed_files:
+                continue
+            out.add(fn)
+        return out
+
+    def _best_result_for_file_from_fused(
+        self,
+        file_name: str,
+        fused: list[dict] | None,
+        query: str,
+    ) -> dict | None:
+        """Pick the highest-scoring fused row for a basename (if any)."""
+        best: dict | None = None
+        best_score = -1.0
+        for raw in fused or []:
+            if not isinstance(raw, dict):
+                continue
+            fn = (raw.get("file_name") or "").strip()
+            if fn != file_name:
+                c = raw.get("content")
+                if isinstance(c, dict):
+                    fn = (c.get("file_name") or "").strip()
+                elif hasattr(c, "file_name"):
+                    fn = (getattr(c, "file_name", "") or "").strip()
+                else:
+                    fn = ""
+            if fn != file_name:
+                continue
+            row = self._fused_item_to_result(raw)
+            if not row:
+                continue
+            if not self._result_has_query_evidence(row, query) and float(row.get("score", 0) or 0) < 0.2:
+                continue
+            sc = float(row.get("score", 0) or 0)
+            if sc > best_score:
+                best_score = sc
+                best = row
+        return best
+
+    def _supplement_visual_images(
+        self,
+        results: list[dict],
+        query: str,
+        *,
+        allowed_files: set[str] | None = None,
+    ) -> list[dict]:
+        """For diagram/boxes/arrows queries, pull top CLIP hits per image file into results."""
+        from retrieval.image_retriever import ImageRetriever
+
+        try:
+            hits = ImageRetriever().retrieve(
+                query, top_n=30, metadata_filter=None, boost_ocr=True,
+            )
+        except Exception as e:
+            logger.warning("visual image supplement failed: %s", e)
+            return results
+
+        additions: list[dict] = []
+        seen_files: set[str] = set()
+        for item, score in hits:
+            fn = (item.get("file_name") or "").strip()
+            if not fn or not self._is_image_file_name(fn):
+                continue
+            if allowed_files is not None and fn not in allowed_files:
+                continue
+            if fn in seen_files:
+                continue
+            seen_files.add(fn)
+            row = {
+                "type": "image",
+                "file_name": fn,
+                "page": item.get("page"),
+                "score": float(score),
+                "snippet": (item.get("ocr_text", "") or item.get("auto_caption", "") or "")[:500],
+                "patient_name": item.get("patient_name", "") or "",
+                "is_pdf_page": item.get("is_pdf_page", False),
+                "path": item.get("path", "") or "",
+                "auto_caption": item.get("auto_caption", "") or "",
+            }
+            if not self._result_has_query_evidence(row, query) and float(score) < 0.22:
+                continue
+            additions.append(row)
+
+        if not additions:
+            return results
+        merged = additions + results
+        logger.info(
+            "[multi-file] visual supplement added image files: %s",
+            [r.get("file_name") for r in additions[:8]],
+        )
+        return merged
+
+    def _ensure_multi_file_results(
+        self,
+        results: list[dict],
+        query: str,
+        fused: list[dict] | None = None,
+        require_files: set[str] | None = None,
+        max_files: int = 12,
+    ) -> list[dict]:
         """Broad chat: surface the best chunk from each relevant file, not only the top file.
 
         Applies to PDFs, markdown, and image uploads (PNG/JPG/etc.): one strong hit per
-        ``file_name``, then the remaining ranked chunks.
+        ``file_name``, then the remaining ranked chunks. Also scans the wider ``fused``
+        pool and ``require_files`` (e.g. all basenames for one patient).
         """
-        if not results:
-            return results
-
         by_file: dict[str, dict] = {}
-        for r in results:
-            fn = (r.get("file_name") or "").strip()
+
+        def _consider(row: dict | None) -> None:
+            if not row:
+                return
+            fn = (row.get("file_name") or "").strip()
             if not fn:
-                continue
-            if not self._result_has_query_evidence(r, query):
-                continue
-            score = float(r.get("score", 0.0) or 0.0)
+                return
+            if not self._result_has_query_evidence(row, query):
+                return
+            score = float(row.get("score", 0.0) or 0.0)
             prev = by_file.get(fn)
             if prev is None or score > float(prev.get("score", 0.0) or 0.0):
-                by_file[fn] = r
+                by_file[fn] = row
+
+        for r in results:
+            _consider(r)
+
+        for raw in fused or []:
+            row = self._fused_item_to_result(raw) if isinstance(raw, dict) else None
+            _consider(row)
+
+        for fn in require_files or set():
+            if fn in by_file:
+                continue
+            row = self._best_result_for_file_from_fused(fn, fused, query)
+            if row:
+                _consider(row)
 
         if len(by_file) <= 1:
             return results
+
+        logger.info(
+            "[multi-file] promoting one hit per file: %s",
+            sorted(by_file.keys())[:max_files],
+        )
 
         reps = sorted(
             by_file.values(),
@@ -875,8 +1041,32 @@ class RAGService:
         # Final cross-type ranking pass (text/image/tree) by per-file semantic
         # coherence. This is the key guardrail for indirect queries over many files.
         if not effective_file_filter:
+            from retrieval.query_classifier import classify_query
+
+            query_type = classify_query(query)
+            require_files: set[str] = set()
+            if effective_patient_filter and effective_patient_filter != "All":
+                require_files = self._file_names_for_patient(
+                    effective_patient_filter, allowed_files,
+                )
+                if allowed_files:
+                    aps = self._infer_medical_aps_pdf_from_query(
+                        f"{effective_patient_filter} {query}",
+                        allowed_files,
+                    )
+                    if aps:
+                        require_files.add(aps)
+            if query_type == "image_heavy":
+                results = self._supplement_visual_images(
+                    results, query, allowed_files=allowed_files,
+                )
             results = self._rerank_results_by_file_intent(results, query)
-            results = self._ensure_multi_file_results(results, query)
+            results = self._ensure_multi_file_results(
+                results,
+                query,
+                fused=fused,
+                require_files=require_files or None,
+            )
             score_sources = self._build_score_sources_multi_file(results, query, max_sources=12)
         else:
             q_lower = (query or "").strip().lower()
